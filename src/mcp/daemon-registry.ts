@@ -219,7 +219,7 @@ export interface StopResult {
   root: string;
   pid: number | null;
   /** 'term' graceful, 'kill' force, 'not-running' stale, 'no-daemon' absent, 'unverified' preserved. */
-  outcome: 'term' | 'kill' | 'not-running' | 'no-daemon' | 'unverified';
+  outcome: 'term' | 'kill' | 'still-running' | 'not-running' | 'no-daemon' | 'unverified';
 }
 
 /**
@@ -228,7 +228,7 @@ export interface StopResult {
  * keys its socket/lockfile). Resolves the pid from the authoritative lockfile,
  * falling back to the registry.
  */
-export async function stopDaemonAt(root: string): Promise<StopResult> {
+export async function stopDaemonAt(root: string, options: { preserveUnverified?: boolean } = {}): Promise<StopResult> {
   let pid: number | null = null;
   let identity: DaemonLockInfo | null = null;
   let lockContents: string | null = null;
@@ -261,6 +261,7 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
     return { root, pid, outcome: 'unverified' };
   }
   if (!await probeDaemonIdentity(identity)) {
+    if (options.preserveUnverified) return { root, pid, outcome: 'unverified' };
     const removed = cleanupDaemonArtifacts(root, lockContents);
     return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
@@ -271,7 +272,9 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
   let outcome: StopResult['outcome'] = 'term';
   if (!(await waitForDeath(pid, 3000))) {
     try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
-    await waitForDeath(pid, 2000);
+    if (!(await waitForDeath(pid, 2000))) {
+      return { root, pid, outcome: 'still-running' };
+    }
     outcome = 'kill';
   }
   cleanupDaemonArtifacts(root, lockContents);
