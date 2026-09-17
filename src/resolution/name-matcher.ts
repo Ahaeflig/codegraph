@@ -11,6 +11,20 @@ import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { isTestFile } from '../search/query-utils';
 
+/** True when a method body is only a not-implemented stub (Python ABC default). */
+function isNotImplementedStub(n: Node, context: ResolutionContext): boolean {
+  const src = context.readFile(n.filePath);
+  if (!src) return false;
+  const start = Math.max(0, n.startLine - 1);
+  const end = Math.max(start + 1, n.endLine);
+  const body = src.split('\n').slice(start, end).join('\n');
+  return (
+    /\bNotImplementedError\b/.test(body) ||
+    /\bnotImplemented\b/.test(body) ||
+    /throw new (?:Error|UnsupportedOperationException)\(\s*['"]not implemented/i.test(body)
+  );
+}
+
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -252,6 +266,19 @@ export function matchFunctionRef(
       return {
         original: ref,
         targetNodeId: pool[0]!.id,
+        confidence: 0.8,
+        resolvedBy: 'function-ref',
+      };
+    }
+    // Base `raise NotImplementedError` / equivalent stubs must not veto the
+    // one real override (`DocStoreConnection.delete_payload_fields` vs
+    // `QdrantConnection.delete_payload_fields`). Two real implementations
+    // still unique-or-drop.
+    const impls = pool.filter((n) => !isNotImplementedStub(n, context));
+    if (impls.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: impls[0]!.id,
         confidence: 0.8,
         resolvedBy: 'function-ref',
       };
