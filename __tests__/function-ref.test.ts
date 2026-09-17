@@ -903,6 +903,41 @@ describe('Function-as-value capture (#756)', () => {
     }
   });
 
+  it('#1820 PYTHON: a test-file mock does not veto the production method', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-1820-py-mock-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.py'),
+      'class Store:\n    def fetch(self, ids):\n        return ids\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'tests'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'tests', 'test_store.py'),
+      'class FakeStore:\n    def fetch(self, ids):\n        return ids\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'consumer.py'),
+      [
+        'class Consumer:',
+        '    def __init__(self, store):',
+        '        self.store = store',
+        '    def via_callback(self, pool, ids):',
+        '        return pool.submit(self.store.fetch, ids)',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const edges = fnRefEdgesInto(cg, 'fetch');
+      expect(sourceNames(cg, edges)).toEqual(['via_callback']);
+      const target = cg.getNode(edges[0]!.target);
+      expect(target?.filePath.endsWith('store.py')).toBe(true);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
   it('#1820 PYTHON: two methods of the same name produce no callback edge', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-1820-py-decoy-'));
     fs.writeFileSync(path.join(tmpDir, 'a.py'), 'class A:\n    def fetch(self, ids):\n        return ids\n');

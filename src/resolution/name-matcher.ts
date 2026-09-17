@@ -9,6 +9,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { isTestFile } from '../search/query-utils';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -242,10 +243,15 @@ export function matchFunctionRef(
         resolvedBy: 'function-ref',
       };
     }
-    if (memberCandidates.length === 1) {
+    // Test doubles (`class _Store: def fetch`) must not veto the one production
+    // method of the same name — that was #1820 still looking "unique-or-drop
+    // silent" on a real repo with unit-test mocks.
+    const production = memberCandidates.filter((n) => !isTestFile(n.filePath));
+    const pool = production.length > 0 ? production : memberCandidates;
+    if (pool.length === 1) {
       return {
         original: ref,
-        targetNodeId: memberCandidates[0]!.id,
+        targetNodeId: pool[0]!.id,
         confidence: 0.8,
         resolvedBy: 'function-ref',
       };
