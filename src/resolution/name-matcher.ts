@@ -216,6 +216,43 @@ export function matchFunctionRef(
   // resolveOne (resolveThisMemberFnRef) — never by name matching here.
   if (ref.referenceName.startsWith('this.')) return null;
 
+  // #1820: `obj.method` / `c.store.Fetch` captured as `*.method`. Methods
+  // AND functions, same-file first, unique-or-drop cross-file. Bare Python
+  // ids stay function-only (the KIND FILTER test); this prefix is only
+  // emitted for an actual member-value AST node.
+  if (ref.referenceName.startsWith('*.')) {
+    const memberName = ref.referenceName.slice(2);
+    if (!memberName) return null;
+    const memberCandidates = context
+      .getNodesByName(memberName)
+      .filter(
+        (n) =>
+          (n.kind === 'function' || n.kind === 'method') &&
+          sameLanguageFamily(n.language, ref.language) &&
+          n.id !== ref.fromNodeId
+      );
+    if (memberCandidates.length === 0) return null;
+    const sameFileMember = memberCandidates.filter((n) => n.filePath === ref.filePath);
+    if (sameFileMember.length > 0) {
+      const target = sameFileMember.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+      return {
+        original: ref,
+        targetNodeId: target.id,
+        confidence: sameFileMember.length === 1 ? 0.95 : 0.9,
+        resolvedBy: 'function-ref',
+      };
+    }
+    if (memberCandidates.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: memberCandidates[0]!.id,
+        confidence: 0.8,
+        resolvedBy: 'function-ref',
+      };
+    }
+    return null;
+  }
+
   // In JS/TS/Python a bare identifier can never be a method value (methods
   // are only reachable through a receiver — `this.m` / `self.m` /
   // `Cls.m`), so bare fn-refs match FUNCTIONS only. This also sidesteps the
