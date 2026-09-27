@@ -51,6 +51,7 @@ import { clearStaleDaemonArtifacts } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import {
   readWriterLock,
+  assertNoRebuild,
   releaseWriterLock,
   tryAcquireWriterLock,
   writerLockHeldMessage,
@@ -106,6 +107,7 @@ function readOnlyFallback(holder: string): MCPEngine {
  * prove that a process owns the legacy writer slot.
  */
 function makeFallbackEngine(root: string): MCPEngine {
+  assertNoRebuild(root);
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
     existing = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));

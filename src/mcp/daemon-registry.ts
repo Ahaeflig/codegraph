@@ -218,7 +218,7 @@ async function waitForDeath(pid: number, timeoutMs: number): Promise<boolean> {
 export interface StopResult {
   root: string;
   pid: number | null;
-  /** 'term' graceful, 'kill' force, 'not-running' stale, 'no-daemon' absent, 'unverified' preserved. */
+  /** 'term' graceful, 'kill' force, 'still-running' refused, 'not-running' stale, 'no-daemon' absent, 'unverified' preserved. */
   outcome: 'term' | 'kill' | 'still-running' | 'not-running' | 'no-daemon' | 'unverified';
 }
 
@@ -226,7 +226,8 @@ export interface StopResult {
  * Stop the daemon serving `root`: SIGTERM, wait, then SIGKILL if it won't go,
  * then sweep its artifacts. `root` must be realpath'd (match how the daemon
  * keys its socket/lockfile). Resolves the pid from the authoritative lockfile,
- * falling back to the registry.
+ * falling back to the registry. Rebuild callers preserve unverified live locks
+ * instead of interpreting a failed probe as permission to discard the database.
  */
 export async function stopDaemonAt(root: string, options: { preserveUnverified?: boolean } = {}): Promise<StopResult> {
   let pid: number | null = null;
@@ -266,11 +267,22 @@ export async function stopDaemonAt(root: string, options: { preserveUnverified?:
     return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
 
+  // Identity probing awaits I/O: never act on a superseded ownership record.
+  const sameLock = (): boolean => {
+    try { return fs.readFileSync(getDaemonPidPath(root), 'utf8') === lockContents; }
+    catch { return lockContents === null; }
+  };
+  if (!sameLock()) return { root, pid, outcome: 'unverified' };
+
   // POSIX: SIGTERM runs the daemon's graceful shutdown. Windows: TerminateProcess
   // (no graceful path), so we always sweep artifacts ourselves below.
   try { process.kill(pid, 'SIGTERM'); } catch { /* raced to exit */ }
   let outcome: StopResult['outcome'] = 'term';
   if (!(await waitForDeath(pid, 3000))) {
+    // Re-prove identity before escalating; the old PID may have been reused.
+    if (!sameLock() || !await probeDaemonIdentity(identity) || !sameLock()) {
+      return { root, pid, outcome: 'still-running' };
+    }
     try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
     if (!(await waitForDeath(pid, 2000))) {
       return { root, pid, outcome: 'still-running' };
