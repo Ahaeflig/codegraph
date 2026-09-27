@@ -8,7 +8,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_BUILT_INS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -2581,6 +2581,14 @@ export function matchMethodCall(
   });
   if (strat1) return strat1;
 
+  // Built-in method names need a validated receiver (#1987). Typed, imported,
+  // object-literal and direct class receivers have had their chance above;
+  // capitalization, word overlap or a unique method name are not evidence
+  // that `list.map()` / `cache.get()` calls a project class.
+  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) &&
+      objectOrClass !== 'this' && objectOrClass !== 'super' &&
+      JS_BUILTIN_METHODS.has(methodName!)) return null;
+
   // Strategy 2: Instance variable receiver - try capitalized form to find class
   // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
@@ -2958,9 +2966,9 @@ function matchTsThisFieldCall(
     (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
   );
   const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // `\b` can't open a name that starts with `#` (an ES private field, #1987):
-  // there is no word boundary between a space and `#`.
-  const fieldStart = field.startsWith('#') ? '(?<![\\w$])' : '\\b';
+  // A word boundary cannot open a private name; it also lets a public
+  // `items` match `#items`. Keep the two field namespaces distinct (#1987).
+  const fieldStart = '(?<![\\w$#])';
   const patterns: Array<{ re: RegExp; valueType: boolean }> = [
     // `storage: typeof DraftHubStorage` — the type OF a value: an object
     // literal used as a namespace. Its members are bare-named functions inside

@@ -9,7 +9,7 @@
  * shape a delegating wrapper takes. The identical call resolved correctly
  * whenever the wrapper had any other name.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -129,5 +129,43 @@ describe('this.<field>.<method>() (#1496)', () => {
   it('leaves a builtin-typed ES private field unresolved (#1987)', () => {
     // `this.#items.add()` on a Set must not bind to the project's `Cart::add`.
     expect(calleesOf('Vault::put')).toEqual([]);
+  });
+});
+
+describe.each(['ts', 'tsx', 'js', 'jsx'])('private field receivers in %s (#1987)', (ext) => {
+  let temp: string;
+  let graph: CodeGraph | undefined;
+  afterEach(() => {
+    graph?.destroy();
+    graph = undefined;
+    if (temp) fs.rmSync(temp, { recursive: true, force: true });
+  });
+
+  it.each(['LF', 'CRLF'])('keeps optional receivers distinct from public fields (%s)', async (ending) => {
+    temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-private-1987-'));
+    const source = `
+export class Mailer { send() {} }
+export class Cart { add() {} }
+export class Vault {
+  #mailer = new Mailer();
+  #items = new Set();
+  items = new Cart();
+  notify() { this.#mailer?.send(); }
+  optional() { this.#mailer.send?.(); }
+  put() { this.#items?.add('x'); }
+  publicPut() { this.items.add('x'); }
+}
+`;
+    fs.writeFileSync(path.join(temp, `vault.${ext}`), ending === 'CRLF' ? source.replace(/\n/g, '\r\n') : source);
+    graph = await CodeGraph.init(temp, { index: true });
+    const callees = (name: string) => {
+      const caller = graph!.getNodesByKind('method').find(n => n.qualifiedName === `Vault::${name}`)!;
+      expect(caller).toBeDefined();
+      return graph!.getCallees(caller.id).map(c => c.node.qualifiedName);
+    };
+    expect(callees('notify')).toEqual(['Mailer::send']);
+    expect(callees('optional')).toEqual(['Mailer::send']);
+    expect(callees('put')).toEqual([]);
+    expect(callees('publicPut')).toEqual(['Cart::add']);
   });
 });
