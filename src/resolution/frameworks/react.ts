@@ -157,6 +157,13 @@ function scanRouteDeclarations(source: string, allowJsx: boolean): RouteDeclarat
       : /^\s*([A-Z][\w]*)\s*$/.exec(value);
     return match?.[1];
   };
+  // The few characters before `at`, trailing whitespace skipped: enough for the
+  // end-anchored checks below without copying the whole prefix per `/` or `<`.
+  const tokenBefore = (at: number): string => {
+    let j = at - 1;
+    while (j >= 0 && /\s/.test(source[j]!)) j--;
+    return source.slice(Math.max(0, j - 11), j + 1);
+  };
   const trivia = (at: number): number => {
     while (at < source.length) {
       if (/\s/.test(source[at]!)) { at++; continue; }
@@ -184,7 +191,7 @@ function scanRouteDeclarations(source: string, allowJsx: boolean): RouteDeclarat
     }
     // A regex can contain braces or JSX-looking text without ending an expression.
     if (ch === '/') {
-      const before = source.slice(0, at).trimEnd();
+      const before = tokenBefore(at);
       if (!before || /[=(:,[!&|?{};]$/.test(before) || /\b(?:return|throw|case|yield)\s*$/.test(before)) {
         let inClass = false;
         for (let i = at + 1; i < source.length && source[i] !== '\n'; i++) {
@@ -200,7 +207,7 @@ function scanRouteDeclarations(source: string, allowJsx: boolean): RouteDeclarat
       }
     }
     if (allowJsx && ch === '<' && /^<(?:[A-Za-z][\w.:-]*|>)/.test(source.slice(at))) {
-      const before = source.slice(0, at).trimEnd();
+      const before = tokenBefore(at);
       // `count<limit` and `factory<Type>()` are not JSX opening tags.
       if (!/[\w$)\]'"]$/.test(before) || /\breturn$/.test(before)) return jsx(at);
     }
