@@ -972,8 +972,47 @@ without over-fitting:
 - **top-up of unspent hold-back:** alamofire's `Session.swift`, 876 chars and a named method short without it
 - **adaptive-path fit test and summary-line reserve:** 3 truncated and 5 over-cap responses → 0
 
+### Agent A/B
+
+`scripts/agent-eval/ab-new-vs-baseline.sh`, baseline pinned to `1cbac0af` by SHA, Sonnet
+`--effort high`, `RUNS=2`, prompts of the form `Use codegraph to answer: <question>`. Raw logs are
+not committed. The three questions: vscode's rpcProtocol serialization and dispatch (the reported
+shape); django's `SQLCompiler.as_sql` / `pre_sql_setup` / `get_select`; and tokio's worker `run` /
+`run_task` / `next_task` / `steal_work` / `park`.
+
+| repo | Read (new / base) | explore calls | duration median | do the builds differ on these queries? |
+|---|---|---|---|---|
+| vscode | **0, 0 / 1, 0** | 3, 3 / 2, 3 | 69s / 48s | yes: +82 to +320 source lines on the `rpcProtocol.ts` / `MessageIO` queries |
+| django | 0, 2 / 1, 1 | 3, 2 / 2, 2 | 43s / 30s | no: 4 of 9 byte-identical, the rest ≤1 line apart except one tail-file swap |
+| tokio | 0, 2 / 0, 1 | 3, 3 / 2, 2 | 177s [49–306] / 31s | no: 0–1 lines apart on 7 of 10, 22–46 on 3 |
+
+Reads tie overall (4 / 4). On vscode, the one repo where the builds actually return different
+bytes, the baseline's Read was the reported symptom itself (`rpcProtocol.ts lines 299 to 355`
+after an explore). The new arm's answers covered the named serializers in both runs (11 of 13
+key symbols vs 9 and 11).
+
+The new arm was slower in every repo. Attribution, per the CG-22 rule (never quote a wall-clock
+gap without the explore-latency and response-size probes):
+
+- **vscode:** model time was equal or lower in the new arm (30.7s / 23.4s vs 31.6s / 30.2s). The
+  gap sat inside explore calls (39s per run vs 12–17s). Replaying the new arm's six queries, CPU
+  per call was within 1–4% across new/base build × new/base index, while the machine's load
+  average was 7–10 from other sessions. Load, not the change.
+- **django, tokio:** the two builds return near-identical responses to these agents' own queries,
+  so a difference between the arms there cannot be the change. tokio's 306s run is a model-side
+  stall (302s of API time, 1.2s in tools).
+- The new arm made 3 explore calls in all 6 runs vs 2.3 per run for baseline. On django and tokio
+  that is sampling for the same reason. A larger n would settle whether vscode's richer responses
+  prompt a deeper follow-up.
+
+Every Read in the django runs, on both builds, is a separate pre-existing gap:
+`SQLCompiler.as_sql`'s 226-line body is never returned, not even to a query that names it and
+its line number.
+
 ### Found, not fixed
 
+- **`SQLCompiler.as_sql` is never returned** (above). It is the cause of every django Read in the
+  A/B, on both builds.
 - **Density ranking starves an isolated named cluster.** Among clusters of equal max importance,
   `rankedClusters` orders by summed member importance ÷ span. Edge-line members inflate the
   density of a named-function-plus-filler cluster, so a cluster holding only a named function
