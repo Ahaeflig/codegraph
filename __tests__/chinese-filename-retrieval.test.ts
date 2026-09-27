@@ -51,9 +51,17 @@ describe('Chinese filename retrieval (#1372)', () => {
         `int prefix_noise_${i}(void) { return ${i}; }\n`
       );
     }
+    fs.writeFileSync(
+      path.join(testDir, '共享模块.ts'),
+      'export function sharedEntry() { return 42; }\n'
+    );
+    fs.writeFileSync(
+      path.join(testDir, 'Service.ts'),
+      'export class Service {}\n'
+    );
 
     cg = CodeGraph.initSync(testDir, {
-      config: { include: ['**/*.lua', '**/*.c', '**/*.svelte'], exclude: [] },
+      config: { include: ['**/*.lua', '**/*.c', '**/*.svelte', '**/*.ts'], exclude: [] },
     });
     await cg.indexAll();
     handler = new ToolHandler(cg);
@@ -119,5 +127,27 @@ describe('Chinese filename retrieval (#1372)', () => {
     });
 
     expect([...context.nodes.values()].some((node) => node.kind === 'file')).toBe(false);
+  });
+
+  it('retrieves a TypeScript file and its source through the same MCP path', async () => {
+    const result = await handler.execute('codegraph_explore', { query: '共享模块' });
+    const text = result.content[0]!.text as string;
+
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain('共享模块.ts');
+    expect(text).toContain('return 42');
+  });
+
+  it('keeps the exact mixed filename ahead of symbol matches under the entry-point cap', async () => {
+    const context = await cg.findRelevantContext('用户Service', { searchLimit: 1 });
+
+    expect(context.roots).toHaveLength(1);
+    expect(context.nodes.get(context.roots[0]!)?.name).toBe('用户Service.lua');
+  });
+
+  it('admits exact file matches when file nodes are explicitly allowed', async () => {
+    const context = await cg.findRelevantContext('示例模块', { nodeKinds: ['file'] });
+
+    expect(context.roots.map((id) => context.nodes.get(id)?.name)).toContain('示例模块.lua');
   });
 });
