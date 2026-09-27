@@ -3,7 +3,7 @@ import { realpathSync } from 'fs';
 import type { Socket } from 'net';
 import type CodeGraph from '../index';
 import { isInitialized } from '../directory';
-import { watchDisabledReason } from '../sync';
+import { LockUnavailableError, watchDisabledReason } from '../sync';
 import { getDaemonSocketCandidates } from './daemon-paths';
 import { connectWithHello } from './proxy';
 import { markWriterReady, readWriterLock, releaseWriterLock, tryAcquireWriterLock } from './writer-lock';
@@ -95,6 +95,9 @@ function ready(root: string, project: Project): Promise<void> {
     return Promise.resolve();
   }
   const gate = activate(root, project).catch((err) => {
+    // A CLI/indexer can hold codegraph.lock even while we own writer.pid.
+    // Leave caughtUp false so the next access or timer retries quietly (#1361).
+    if (err instanceof LockUnavailableError) return;
     process.stderr.write(`[CodeGraph MCP] Catch-up sync failed for ${root}: ${err instanceof Error ? err.message : String(err)}\n`);
   }).finally(() => {
     if (project.gate === gate) project.gate = null;
@@ -145,10 +148,7 @@ async function activate(root: string, project: Project): Promise<void> {
       process.stderr.write(`[CodeGraph MCP] File watcher active for ${root} — graph will auto-sync on changes\n`);
     }
   }
-  const result = await project.cg.sync();
-  if (result.filesChecked === 0 && result.durationMs === 0) {
-    throw new Error('Another indexing operation is still running; retrying catch-up.');
-  }
+  await project.cg.sync();
   project.caughtUp = true;
   markWriterReady(root);
 }

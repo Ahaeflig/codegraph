@@ -255,6 +255,36 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
     expect(opened[0]!.isWatching()).toBe(true);
   });
 
+  it('quietly retries catch-up after an indexing lock is released (#1361)', async () => {
+    const lock = path.join(serviceA, '.codegraph/codegraph.lock');
+    const writer = path.join(serviceA, '.codegraph/writer.pid');
+    const prev = process.env.CODEGRAPH_NO_WATCH;
+    // Ensure the lifecycle retry, not a watcher event, repairs the index.
+    process.env.CODEGRAPH_NO_WATCH = '1';
+    const stderr = vi.spyOn(process.stderr, 'write');
+    try {
+      fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function afterIndexLock() {}\n');
+      fs.writeFileSync(lock, String(process.pid));
+      await search(serviceA, 'afterIndexLock');
+      expect(names(serviceA)).toEqual(['alphaOriginal']);
+      expect(fs.readFileSync(lock, 'utf8')).toBe(String(process.pid));
+      expect(JSON.parse(fs.readFileSync(writer, 'utf8')).ready).toBe(false);
+      expect(stderr.mock.calls.map(([text]) => String(text)).join('')).not.toContain('Catch-up sync failed');
+
+      fs.unlinkSync(lock);
+      // No second query: the lifecycle's periodic retry must finish catch-up.
+      // SQLite rows can be visible before sync's final maintenance finishes.
+      expect(await waitFor(async () => JSON.parse(fs.readFileSync(writer, 'utf8')).ready === true, 10000)).toBe(true);
+      expect(names(serviceA)).toEqual(['afterIndexLock']);
+      expect(opened[0]!.isWatching()).toBe(false);
+    } finally {
+      fs.rmSync(lock, { force: true });
+      stderr.mockRestore();
+      if (prev === undefined) delete process.env.CODEGRAPH_NO_WATCH;
+      else process.env.CODEGRAPH_NO_WATCH = prev;
+    }
+  });
+
   it('honors no-watch for explicit projects', async () => {
     await engine.stop();
     engine = new MCPEngine({ watch: false });
@@ -302,6 +332,9 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
     try {
       fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function evictionCatchUp() {}\n');
       await search(serviceA, 'evictionCatchUp');
+      // Only A should time out. Finish every other catch-up before expecting
+      // B to be the oldest evictable entry; 10ms can expire on those too.
+      process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = '0';
       for (const root of roots.slice(1)) await search(root, 'symbol');
       expect(() => opened[0]!.getStats()).not.toThrow();
       expect(() => opened[1]!.getStats()).toThrow();
