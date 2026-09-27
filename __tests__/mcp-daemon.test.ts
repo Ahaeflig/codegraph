@@ -722,15 +722,29 @@ describe('Shared MCP daemon (issue #411)', () => {
     servers.push(server);
     sendInitialize(server.child, `file://${tempDir}`, 1);
     await waitFor(() => findResponse(server.stdout, 1), 10000);
-    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    // initialize is answered locally, and a PID file can belong to a daemon
+    // still starting. Establish a real live session before measuring silence.
+    const attached = await waitFor(
+      () => server.stderr.find((line) => line.includes('Attached to shared daemon')),
+      10000,
+    );
+    sendMessage(server.child, {
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'codegraph_status', arguments: {} },
+    });
+    const status = await waitFor(() => findResponse(server.stdout, 2), 10000);
+    expect(status.error).toBeUndefined();
+    expect(status.result?.isError).not.toBe(true);
+    expect(JSON.stringify(status.result)).toContain('CodeGraph Status');
     const daemonPid = readLockPid(realRoot)!;
+    expect(attached).toContain(`(pid ${daemonPid},`);
     expect(isAlive(daemonPid)).toBe(true);
 
     // Stay silent well past several backstop windows. The live session's peer is
     // provably alive, so the daemon must keep running (and never log a backstop
     // shutdown), with its lockfile intact.
     await new Promise((r) => setTimeout(r, 4000)); // > 3× maxIdle
-    expect(isAlive(daemonPid)).toBe(true);
+    expect(isAlive(daemonPid), readDaemonLog(realRoot) + '\n' + server.stderr.join('\n')).toBe(true);
     expect(readDaemonLog(realRoot)).not.toContain('inactivity backstop');
     expect(readLockPid(realRoot)).toBe(daemonPid);
   }, 30000);
