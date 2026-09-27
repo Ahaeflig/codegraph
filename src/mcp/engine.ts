@@ -45,6 +45,12 @@ export interface MCPEngineOptions {
    */
   queryPool?: boolean;
   /**
+   * Worker cap when `CODEGRAPH_QUERY_POOL_SIZE` is unset. A direct (single-client)
+   * session sets a small cap so every session doesn't hold one worker per core;
+   * the shared daemon leaves it unset and scales with the machine.
+   */
+  queryPoolDefaultMax?: number;
+  /**
    * Project root whose writer slot must be claimed synchronously before this
    * engine can open the graph. Used by proxy fallback to fence catch-up sync,
    * not just the later file watcher.
@@ -99,7 +105,11 @@ export class MCPEngine {
    */
   private maybeStartPool(root: string | null): void {
     if (!this.opts.queryPool || this.queryPool || this.closed) return;
-    const size = resolvePoolSize(process.env.CODEGRAPH_QUERY_POOL_SIZE, os.cpus().length);
+    const envSize = process.env.CODEGRAPH_QUERY_POOL_SIZE;
+    let size = resolvePoolSize(envSize, os.cpus().length);
+    if ((envSize === undefined || envSize === '') && this.opts.queryPoolDefaultMax !== undefined) {
+      size = Math.min(size, this.opts.queryPoolDefaultMax);
+    }
     if (size <= 0) {
       process.stderr.write('[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
       return;
