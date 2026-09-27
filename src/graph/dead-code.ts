@@ -818,7 +818,7 @@ function overrideCandidates(
   // level rather than one per container. `reach` maps an ancestor back to the
   // containers it is an ancestor of.
   const reach = new Map<string, Set<string>>();
-  const seen = new Set<string>(containerIds);
+  const seen = new Map(containerIds.map((id) => [id, new Set([id])]));
   let frontier = containerIds.map((id) => ({ id, roots: new Set<string>([id]) }));
 
   for (let depth = 0; depth < MAX_OVERRIDE_ANCESTOR_DEPTH && frontier.length > 0; depth++) {
@@ -833,16 +833,22 @@ function overrideCandidates(
       const roots = rootsOf.get(edge.source);
       if (!roots) continue;
       const merged = next.get(edge.target) ?? new Set<string>();
-      for (const root of roots) merged.add(root);
-      next.set(edge.target, merged);
+      const visited = seen.get(edge.target) ?? new Set<string>();
       const known = reach.get(edge.target) ?? new Set<string>();
-      for (const root of roots) known.add(root);
-      reach.set(edge.target, known);
+      // An ancestor may already be a candidate root. Only skip pairs we have
+      // propagated, so later descendants still reach all of its ancestors.
+      for (const root of roots) {
+        if (visited.has(root)) continue;
+        visited.add(root);
+        merged.add(root);
+        known.add(root);
+      }
+      seen.set(edge.target, visited);
+      if (merged.size > 0) next.set(edge.target, merged);
+      if (known.size > 0) reach.set(edge.target, known);
     }
     frontier = [];
     for (const [id, roots] of next) {
-      if (seen.has(id)) continue;
-      seen.add(id);
       frontier.push({ id, roots });
     }
   }
