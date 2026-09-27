@@ -142,105 +142,88 @@ function pickClosestFileNode(candidates: Node[], ref: UnresolvedRef): Node {
  */
 const LANGUAGE_FAMILY: Record<string, string> = {
   java: 'jvm', kotlin: 'jvm', scala: 'jvm',
-  swift: 'apple', objc: 'apple',
+  swift: 'native', objc: 'native',
   // ArkTS is a TS superset — every HarmonyOS project mixes `.ets` UI with
   // `.ts` logic modules, so refs must cross freely between them.
   typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web', arkts: 'web',
-  c: 'c', cpp: 'c',
+  c: 'native', cpp: 'native',
   // Razor/Blazor markup names C# types — same family so `@model Foo` /
   // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
-  csharp: 'dotnet', razor: 'dotnet',
+  csharp: 'dotnet', razor: 'dotnet', vbnet: 'dotnet',
+  svelte: 'web', vue: 'web', astro: 'web',
+  cfml: 'cfml', cfscript: 'cfml',
 };
 export function sameLanguageFamily(a: string, b: string): boolean {
   if (a === b) return true;
   const fa = LANGUAGE_FAMILY[a];
   return fa !== undefined && fa === LANGUAGE_FAMILY[b];
 }
-/**
- * True when `lang` belongs to a known multi-language family (jvm/apple/web/c).
- * Languages not listed (php, python, go, ruby, rust, dart, …) and config
- * formats (yaml/xml/blade) form their own singleton families and return
- * `false` — used to leave config↔code framework bridges (whose config side is
- * never a known programming-language family) out of the cross-family gate.
- */
-export function isKnownLanguageFamily(lang: string): boolean {
-  return LANGUAGE_FAMILY[lang] !== undefined;
-}
-/**
- * True when `a` and `b` are two DIFFERENT *known* language families — the
- * signature of a coincidental cross-language name collision (a TS `import
- * React` matching a Swift `import React`, a C++ `#include "X.h"` matching a
- * same-named ObjC header on another platform). The both-*known* test is
- * deliberately weaker than {@link sameLanguageFamily}'s negation: a
- * single-file-component language that carries its own tag (`vue`/`svelte`)
- * importing a `.ts` module, or any singleton-family language (php/go/ruby/…),
- * returns `false` here and is left alone.
- */
-export function crossesKnownFamily(a: string, b: string): boolean {
-  return isKnownLanguageFamily(a) && isKnownLanguageFamily(b) && !sameLanguageFamily(a, b);
-}
-/**
- * Drop cross-language candidates from a name lookup. Two regimes:
- *  - `references` (type-usage): a type named in language X resolves to a
- *    SAME-family type, never a coincidentally same-named symbol in another
- *    language (the Android `BatteryManager` system class vs a JS one). Strict
- *    same-family filter — cross-language communication is `calls`, not refs.
- *  - `imports` (import binding): an `import`/`#include` never crosses two
- *    KNOWN families (TS `import React` ↮ Swift `import React`). Weaker
- *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
- */
-function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
-  if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
-    return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
-  }
-  if (ref.referenceKind === 'imports') {
-    return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
-  }
-  return candidates;
-}
-
-/**
- * Programming languages for {@link isForeignCall}: the known families plus the
- * singleton languages, with the single-file component formats in the web
- * family. A language missing here (config, template, CFML, VB.NET…) is never
- * gated.
- */
-const CALL_FAMILY: Record<string, string> = {
+/** Config/markup transitions stay open; every other code language has a family. */
+const CODE_FAMILY: Record<string, string> = {
   ...LANGUAGE_FAMILY,
-  svelte: 'web', vue: 'web', astro: 'web',
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
   lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
+  nix: 'nix', cobol: 'cobol',
 };
 
-/** Kinds that live inside a type — reachable by a bare name only from that type. */
-const MEMBER_KINDS = new Set(['method', 'property', 'field', 'enum_member']);
+export function crossesCodeBoundary(a: string, b: string): boolean {
+  return CODE_FAMILY[a] !== undefined && CODE_FAMILY[b] !== undefined &&
+    CODE_FAMILY[a] !== CODE_FAMILY[b];
+}
 
 /**
- * Whether a bare-named call would cross a language family into a symbol it
- * cannot reach. Across families a call is linked only through the C ABI: a
- * C/C++ symbol, or a symbol a C, Objective-C or Swift caller reaches through a
- * header (Swift calling a cgo `//export` function, C calling a Rust
- * `extern "C"` one). Those are free functions, never a class member — a
- * receiver-less call reaches a member only from inside the member's own type —
- * and never another language's class or variable.
- * Without this, a call that HAD a receiver but reached the resolver as the
- * bare method name (`v.iter().map()` in Rust) matched a TypeScript class's
- * `map`, and Kotlin's `Log.i(...)` a minified JavaScript function `i`.
- * Applied to the ONE candidate a strategy would commit to, never to the
- * candidate set: dropping foreign candidates from a crowd would leave a lone
- * survivor and hand it every call of that name (`new URL(u).toString()` onto
- * the one web-family `toString`).
+ * Cross-family name matches need a framework export or an actual ABI boundary,
+ * not merely a native caller. ABI evidence is scoped to the named free function.
  */
-function isForeignCall(candidate: Node, ref: UnresolvedRef): boolean {
+function hasBridgeEvidence(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (ref.referenceKind !== 'calls') return false;
-  const from = CALL_FAMILY[ref.language];
-  const to = CALL_FAMILY[candidate.language];
-  if (from === undefined || to === undefined || from === to) return false;
-  if (MEMBER_KINDS.has(candidate.kind)) return true;
-  if (candidate.kind === 'function') return !(to === 'c' || from === 'c' || from === 'apple');
-  // A C type or global (a struct initializer, a function-pointer variable)
-  // is reachable only from the languages that import C headers directly.
-  return !(to === 'c' && from === 'apple');
+  // Expo's extractor creates explicit JS exports, resolved by the ordinary
+  // name matcher rather than a framework resolve() branch.
+  if (CODE_FAMILY[ref.language] === 'web' && candidate.id.startsWith('expo-module:') &&
+      candidate.isExported && (candidate.language === 'swift' || candidate.language === 'kotlin')) return true;
+  if (candidate.kind !== 'function') return false;
+  const name = candidate.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (CODE_FAMILY[ref.language] === 'native') {
+    const source = context.readFile(candidate.filePath);
+    if (!source) return false;
+    if (candidate.language === 'go') {
+      const declaration = source.split('\n').slice(Math.max(0, candidate.startLine - 2), candidate.endLine).join('\n');
+      return /\bimport\s+(?:\(\s*)?"C"/.test(stripCommentsForRegex(source, 'go')) &&
+        new RegExp('^//export ' + name + '\\r?\\nfunc ' + name + '\\s*\\(', 'm').test(declaration);
+    }
+    if (candidate.language === 'rust') {
+      const declaration = source.split('\n').slice(candidate.startLine - 1, candidate.endLine).join('\n');
+      return new RegExp('\\bpub\\s+extern\\s+"C"\\s+fn\\s+' + name + '\\b')
+        .test(stripCommentsForRegex(declaration, 'rust'));
+    }
+  }
+  if (candidate.language === 'c' || candidate.language === 'cpp') {
+    const source = context.readFile(ref.filePath);
+    if (!source) return false;
+    if (ref.language === 'go') {
+      return /\bimport\s+(?:\(\s*)?"C"/.test(stripCommentsForRegex(source, 'go')) &&
+        ref.referenceName === 'C.' + candidate.name;
+    }
+    if (ref.language === 'rust') {
+      return new RegExp('extern\\s+"C"\\s*\\{[^}]*\\bfn\\s+' + name + '\\s*\\(')
+        .test(stripCommentsForRegex(source, 'rust'));
+    }
+  }
+  return false;
+}
+
+/** Reject the chosen result without shrinking a pool or trying a replacement. */
+export function gateLanguageMatch(
+  result: ResolvedRef | null,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (!result) return result;
+  const target = context.getNodeById?.(result.targetNodeId) ??
+    context.getNodesByName(ref.referenceName).find((n) => n.id === result.targetNodeId);
+  if (target && crossesCodeBoundary(ref.language, target.language) &&
+      !hasBridgeEvidence(target, ref, context)) return null;
+  return result;
 }
 
 /**
@@ -817,7 +800,11 @@ export function matchByExactName(
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
   }
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+  const candidates = context.getNodesByName(ref.referenceName)
+    // Type/value references retain same-family eligibility: a native namesake
+    // must not hide the actual web type. Calls still gate only the winner.
+    .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
+      sameLanguageFamily(n.language, ref.language))
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context))
@@ -848,7 +835,7 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
-    if (!isCrossFileReachable(candidates[0]!, ref, context) || isForeignCall(candidates[0]!, ref)) return null;
+    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -869,7 +856,7 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch && isCrossFileReachable(bestMatch, ref, context) && !isForeignCall(bestMatch, ref)) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
@@ -3477,10 +3464,9 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(
-    candidates.filter((n) => callableKinds.has(n.kind)),
-    ref
-  );
+  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind))
+    .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
+      sameLanguageFamily(n.language, ref.language));
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
@@ -3505,7 +3491,6 @@ export function matchFuzzy(
     finalCandidates.length === 1 &&
     isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
     isCrossFileReachable(finalCandidates[0]!, ref, context) &&
-    !isForeignCall(finalCandidates[0]!, ref) &&
     !(isBareJsCall(ref, context) &&
       (finalCandidates[0]!.kind === 'method' ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
@@ -3574,6 +3559,13 @@ export function dumpNameMatcherProfile(label: string): void {
 }
 
 export function matchReference(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  return gateLanguageMatch(matchReferenceInner(ref, context), ref, context);
+}
+
+function matchReferenceInner(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
