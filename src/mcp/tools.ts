@@ -37,6 +37,7 @@ import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths
 import {
   existsSync,
   readFileSync,
+  realpathSync,
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
@@ -1504,11 +1505,6 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
-  // Another spelling of an open root (a symlinked checkout, a case-variant) →
-  // the projectCache key it shares a connection with (#1057). Kept apart from
-  // projectCache so that map still holds ONE key per instance: dropping that
-  // key drops the connection for every spelling, never leaves a closed one.
-  private rootAliases: Map<string, string> = new Map();
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1826,26 +1822,19 @@ export class ToolHandler {
     const cached = this.projectCache.get(resolvedRoot);
     if (cached) return this.freshen(cached);
 
-    // A new spelling of a root that is already open — a symlinked checkout, or
-    // a case-variant on a case-insensitive mount — is the SAME index. Serve it
-    // from the open connection instead of opening a second one to the same
-    // `.codegraph/codegraph.db` (#1057), and remember the spelling as an alias
-    // of that entry's key. An alias whose entry is gone is dropped, not served.
-    const aliasOf = this.rootAliases.get(resolvedRoot);
-    if (aliasOf !== undefined) {
-      const open = this.projectCache.get(aliasOf);
-      if (open) return this.freshen(open);
-      this.rootAliases.delete(resolvedRoot);
-    }
+    // Compare current identities on every cache miss: a previously seen alias
+    // may have been retargeted or recreated since the last call (#1057).
     for (const [root, open] of this.projectCache) {
       if (isSameIndexRoot(root, resolvedRoot)) {
-        this.rootAliases.set(resolvedRoot, root);
         return this.freshen(open);
       }
     }
 
-    const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(resolvedRoot, cg);
+    // Pin the owner to the symlink target, so retargeting the first spelling
+    // cannot move an existing connection onto another cached project.
+    const ownerRoot = realpathSync.native(resolvedRoot);
+    const cg = loadCodeGraph().openSync(ownerRoot);
+    this.projectCache.set(ownerRoot, cg);
     return cg;
   }
 
@@ -1884,7 +1873,6 @@ export class ToolHandler {
       cg.close();
     }
     this.projectCache.clear();
-    this.rootAliases.clear();
     this.worktreeMismatchCache.clear();
   }
 

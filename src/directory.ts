@@ -180,13 +180,13 @@ export function statInode(p: string): string | null {
  * DrvFs `/mnt/c`), where `realpathSync` keeps the caller's casing (#1057).
  * Compares the identity of both data directories as they are NOW, so an inode
  * reused after a delete can't match: the deleted root no longer stats. Windows
- * has no usable inode, so it compares the on-disk-cased realpath, case-folded.
+ * has no usable inode, so it compares the on-disk-cased native realpaths.
  */
 export function isSameIndexRoot(a: string, b: string): boolean {
   if (a === b) return true;
   if (process.platform === 'win32') {
     try {
-      return fs.realpathSync.native(a).toLowerCase() === fs.realpathSync.native(b).toLowerCase();
+      return fs.realpathSync.native(getCodeGraphDir(a)) === fs.realpathSync.native(getCodeGraphDir(b));
     } catch {
       return false;
     }

@@ -7,7 +7,7 @@
  * SEPARATE connection to the same `.codegraph/codegraph.db`. The cache stays
  * path-keyed (a same-path recreate must still heal in place, #925); a miss now
  * checks whether an open root is the same index as the new spelling, compared
- * as it is on disk NOW, and files the spelling as an alias of that connection.
+ * as it is on disk NOW, without caching an alias that could later be retargeted.
  *
  * The symlink case is the deterministic, filesystem-agnostic stand-in for the
  * case-insensitive-mount scenario: both give two path strings for one inode.
@@ -80,7 +80,7 @@ describe('isSameIndexRoot (#1057)', () => {
     expect(id).toBe(`${s.dev}:${s.ino}`);
   });
 
-  windowsOnly('has no inode on Windows, and compares case-folded real paths instead', () => {
+  windowsOnly('has no inode on Windows, and compares on-disk-cased real paths instead', () => {
     const real = makeProject('Proj');
     expect(statInode(real)).toBeNull();
     expect(isSameIndexRoot(real, real.toLowerCase())).toBe(true);
@@ -129,6 +129,49 @@ describe('ToolHandler connection cache (#1057)', () => {
     expect(open(link)).toBe(first);
     // And the alias is remembered: the same spelling is served again.
     expect(open(link)).toBe(first);
+  });
+
+  it('revalidates a previously seen alias after it is retargeted', async () => {
+    const a = await makeIndexed('a');
+    const b = await makeIndexed('b');
+    const link = path.join(tmp, 'link');
+    fs.symlinkSync(a, link, 'junction');
+    const first = open(a);
+    const second = open(b);
+    expect(open(link)).toBe(first);
+
+    fs.unlinkSync(link);
+    fs.symlinkSync(b, link, 'junction');
+    expect(open(link)).toBe(second);
+    expect(open(a)).toBe(first);
+  });
+
+  it('keeps the connection owner stable when the first spelling is a symlink', async () => {
+    const a = await makeIndexed('a');
+    const b = await makeIndexed('b');
+    const link = path.join(tmp, 'link');
+    fs.symlinkSync(a, link, 'junction');
+    const first = open(link);
+    const second = open(b);
+    expect(open(a)).toBe(first);
+
+    fs.unlinkSync(link);
+    fs.symlinkSync(b, link, 'junction');
+    expect(open(link)).toBe(second);
+    expect(open(a)).toBe(first);
+  });
+
+  posixOnly('revalidates an alias replaced by a distinct indexed directory', async () => {
+    const real = await makeIndexed('proj');
+    const link = path.join(tmp, 'link');
+    fs.symlinkSync(real, link, 'junction');
+    const first = open(real);
+    expect(open(link)).toBe(first);
+
+    fs.unlinkSync(link);
+    await makeIndexed('link');
+    expect(open(link)).not.toBe(first);
+    expect(open(real)).toBe(first);
   });
 
   it('shares the default instance with another spelling of its root', async () => {
