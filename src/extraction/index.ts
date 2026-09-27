@@ -241,10 +241,9 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
   // `build` is also a legal Java package segment. Keep it under conventional
   // Java source roots while continuing to exclude module/build output (#1642).
+  // Unignore only the directory, not its subtree: other defaults still apply.
   '!**/src/main/java/**/build/',
-  '!**/src/main/java/**/build/**',
   '!**/src/test/java/**/build/',
-  '!**/src/test/java/**/build/**',
 ];
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
