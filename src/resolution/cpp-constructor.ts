@@ -15,6 +15,7 @@
  *    type declaration is not a callee.
  * These refs never fall through to the generic name strategies.
  */
+import type { Node } from '../types';
 import type { ResolvedRef, ResolutionContext, UnresolvedRef } from './types';
 
 const CONSTRUCTOR_REF = /^(.*)::([^:]+)\/(\d+)$/;
@@ -24,10 +25,11 @@ export function isCppConstructorRef(ref: UnresolvedRef): boolean {
 }
 
 /** Admissible argument counts of a `(params)` signature; null when it can't be read. */
-function arityRange(signature: string | undefined): { min: number; max: number } | null {
+function constructorShape(signature: string | undefined): { min: number; max: number; key: string } | null {
+  signature = signature?.replace(/;$/, '');
   if (!signature?.startsWith('(') || !signature.endsWith(')')) return null;
   const text = signature.slice(1, -1).trim();
-  if (!text || text === 'void') return { min: 0, max: 0 };
+  if (!text || text === 'void') return { min: 0, max: 0, key: '' };
   // Split on top-level commas only: `std::map<K, V>`, `int (*cb)(int, int)`
   // and `T x = f(a, b)` all nest their commas.
   const parts: string[] = [];
@@ -58,7 +60,18 @@ function arityRange(signature: string | undefined): { min: number; max: number }
   // or a template bracket — leave those to a compiler.
   if (parts.some((p) => /[<>]=|==|!=/.test(p))) return null;
   const variadic = parts.some((p) => p.includes('...'));
+  const types = parts.map((p) => {
+    let type = p.split('=')[0]!.trim();
+    // Strip an optional parameter name, retaining unnamed built-in types
+    // (`unsigned int`, `long long`) and qualifiers. Complex declarators stay
+    // distinct unless their spelling matches; uncertainty must not merge overloads.
+    type = type.replace(/(.*[\s*&>])([A-Za-z_]\w*)$/, (whole, prefix: string, name: string) =>
+      /^(?:void|bool|char|short|int|long|float|double|signed|unsigned|const|volatile)$/.test(name)
+        || /^(?:const|volatile|struct|class|enum)\s*$/.test(prefix) ? whole : prefix);
+    return type.replace(/\s+/g, '');
+  });
   return {
+    key: types.join(','),
     min: parts.filter((p) => !p.includes('=') && !p.includes('...')).length,
     max: variadic ? Infinity : parts.length,
   };
@@ -82,7 +95,7 @@ export function matchCppConstructor(ref: UnresolvedRef, context: ResolutionConte
   for (const qualified of candidates) {
     const owners = context
       .getNodesByQualifiedName(qualified)
-      .filter((n) => n.language === 'cpp' && (n.kind === 'class' || n.kind === 'struct'));
+      .filter((n) => n.language === 'cpp' && (n.kind === 'class' || n.kind === 'struct' || n.kind === 'union'));
     if (owners.length === 0) continue;
     const constructors = context
       .getNodesByName(name!)
@@ -90,12 +103,24 @@ export function matchCppConstructor(ref: UnresolvedRef, context: ResolutionConte
     // Brace-init prefers an initializer_list overload over arity — that
     // choice needs the argument types, so decline.
     if (constructors.some((n) => /\binitializer_list\b/.test(n.signature ?? ''))) return null;
-    const admitting = constructors.filter((n) => {
-      const range = arityRange(n.signature);
-      return range !== null && range.min <= argc && argc <= range.max;
-    });
+    // A prototype and its out-of-line definition describe one overload.
+    // Merge their admissible ranges, then prefer the executable definition.
+    const overloads = new Map<string, { nodes: Node[]; min: number; max: number }>();
+    for (const node of constructors) {
+      const shape = constructorShape(node.signature);
+      if (!shape) return null;
+      const prior = overloads.get(shape.key);
+      if (prior) {
+        prior.nodes.push(node);
+        prior.min = Math.min(prior.min, shape.min);
+      } else overloads.set(shape.key, { nodes: [node], min: shape.min, max: shape.max });
+    }
+    const admitting = [...overloads.values()].filter((o) => o.min <= argc && argc <= o.max);
     if (admitting.length !== 1) return null;
-    return { original: ref, targetNodeId: admitting[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+    const definitions = admitting[0]!.nodes.filter((n) => !n.signature?.endsWith(';'));
+    const targets = definitions.length > 0 ? definitions : admitting[0]!.nodes;
+    if (targets.length !== 1) return null;
+    return { original: ref, targetNodeId: targets[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' };
   }
   return null;
 }

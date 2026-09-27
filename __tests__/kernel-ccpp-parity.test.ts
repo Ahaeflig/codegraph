@@ -166,7 +166,7 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     ]);
     expect(
       result.nodes.filter((n) => n.kind === 'method' && n.name === 'Widget').map((n) => n.signature).sort()
-    ).toEqual(['()', '(int a, int b = 2)', '(int value)']);
+    ).toEqual(['()', '();', '(int a, int b = 2)', '(int value)', '(int value);']);
     const ctorRefs = result.unresolvedReferences
       .filter((r) => r.referenceKind === 'calls' && r.referenceName.includes('/'))
       .map((r) => r.referenceName);
@@ -181,7 +181,15 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
       'Widget::Widget/2',
       'app::Widget::Widget/1',
       'Box::Box/1',
+      'Widget::Widget/0',
     ]);
+  });
+
+  it.each(['\n', '\r\n'])('constructor prototypes and array elements remain in parity (%j)', (eol) => {
+    const source = ['struct Widget {', ' Widget(int value = 1);', '};',
+      'Widget::Widget(int renamed) {}', 'int argument() { return 2; }',
+      'void run() { Widget plain[2]; Widget empty[2]{}; Widget items[3]{{argument()}, {2}}; Widget grid[2][2]{{{1}, {2}}, {{3}}}; Widget scalars[2]{1, 2}; Widget hex[0x2]{{1}}; Widget sized[2u]{{1}}; }', ''].join(eol);
+    assertParity('arrays.cpp', source, 'cpp');
   });
 
   it('macro fixture (c): #define constants at file scope and inside a body (#1838)', () => {

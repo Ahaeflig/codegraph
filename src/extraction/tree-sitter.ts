@@ -21,7 +21,7 @@ import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandida
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
-import { stripCppTemplateArgs } from './languages/c-cpp';
+import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -1090,6 +1090,11 @@ export class TreeSitterExtractor {
     if (this.language === 'pascal') {
       skipChildren = this.visitPascalNode(node);
       if (skipChildren) return;
+    }
+
+    if (this.language === 'cpp' && isCppConstructorDeclaration(node)) {
+      this.extractMethod(node);
+      return;
     }
 
     // C/C++ function-like macros (`#define TRACE(x) ...`) become `constant`
@@ -5223,13 +5228,13 @@ export class TreeSitterExtractor {
    *  - an `init_declarator` whose `value` is an `argument_list` (`(args)`) or
    *    `initializer_list` (`{args}`) carries constructor arguments — arity is
    *    the argument count. An array declarator's braces hold ELEMENTS, not
-   *    constructor arguments, so it counts as construction but has no arity;
+   *    constructor arguments, so each braced element has its own arity;
    *  - pointer / reference / function declarators construct nothing:
    *    `T* p{}` is a null pointer, `T& r{x}` binds a reference, and the
    *    most-vexing-parse `T c();` is a function declaration.
    *
-   * `instantiates` (the type) is emitted when any declarator carries
-   * arguments — exactly the #1035 shape. `calls` (`T::T/arity`, resolved to
+   * `instantiates` (the type) is retained for initialized declarations,
+   * preserving the #1035 dependency edges. `calls` (`T::T/arity`, resolved to
    * the constructor by src/resolution/cpp-constructor.ts, #1839) is emitted
    * for every declarator with an arity, default construction included.
    * Mirrored in the kernel (ccpp/mod.rs cpp_stack_constructions).
@@ -5251,7 +5256,8 @@ export class TreeSitterExtractor {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'storage_class_specifier' && getNodeText(child, this.source) === 'extern') return none;
-      if (child.type === 'identifier') {
+      if (child.type === 'identifier' || child.type === 'array_declarator') {
+        if (child.type === 'array_declarator' && !this.cppObjectArray(child)) continue;
         arities.push(0);
         continue;
       }
@@ -5263,9 +5269,38 @@ export class TreeSitterExtractor {
       instantiates = true;
       if (declarator.type === 'identifier') {
         arities.push(value.namedChildren.filter((c) => c.type !== 'comment').length);
+      } else if (this.cppObjectArray(declarator)) {
+        const dimensions: number[] = [];
+        let array: SyntaxNode | null = declarator;
+        while (array?.type === 'array_declarator') {
+          const size = getChildByField(array, 'size')?.text ?? '';
+          dimensions.unshift(/^\d+$/.test(size) && Number.isSafeInteger(Number(size)) ? Number(size) : NaN);
+          array = getChildByField(array, 'declarator');
+        }
+        const elements = (list: SyntaxNode, depth: number): void => {
+          const entries = list.namedChildren.filter((c) => c.type !== 'comment');
+          let elided = false;
+          for (const entry of entries) {
+            if (depth + 1 < dimensions.length) {
+              if (entry.type === 'initializer_list') elements(entry, depth + 1);
+              else elided = true; // Unbraced multidimensional layout needs type information.
+            } else {
+              arities.push(entry.type === 'initializer_list'
+                ? entry.namedChildren.filter((c) => c.type !== 'comment').length : 1);
+            }
+          }
+          if (!elided && (entries.length === 0 || dimensions[depth]! > entries.length)) arities.push(0);
+        };
+        elements(value, 0);
       }
     }
     return { instantiates, arities };
+  }
+
+  private cppObjectArray(node: SyntaxNode): boolean {
+    let element = getChildByField(node, 'declarator');
+    while (element?.type === 'array_declarator') element = getChildByField(element, 'declarator');
+    return element?.type === 'identifier';
   }
 
   /**

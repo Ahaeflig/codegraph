@@ -9,43 +9,25 @@
  * callee that never existed (#1838). The resolver asks this before trying
  * any strategy and drops such a ref.
  *
- * This is a textual include walk, not a C preprocessor:
- *  - each file is summarized ONCE per resolution context into the events
- *    that matter — function-like `#define NAME(` (the object-like defines
- *    a vendor header carries by the ten thousand are skipped on syntax),
- *    `#undef`, and `#include`. `#if` / `#ifdef` / `#ifndef`
- *    / `#elif` / `#else` are evaluated with what the file itself defines
- *    (and literals), with the include-guard idiom (`#ifndef X_H` directly
- *    followed by `#define X_H`) read as the first inclusion; a condition the
- *    file can't decide (`#ifdef __GNUC__`, a build flag, a defaulted
- *    `#define ENABLE_X 0`) leaves its arm "possible";
- *  - a translation unit is the root file's events with its in-repo includes
- *    (next to the including file, through the configured include dirs, or a
- *    unique basename match) spliced in at the include line, each file at
- *    most once — include guards and `#pragma once` make a later inclusion a
- *    no-op in practice, and re-walking a shared header from every include
- *    site is exponential;
- *  - events are kept in source order, so a call ABOVE the definition, or
- *    after an `#undef`, is not a macro use;
- *  - only a DEFINITE definition suppresses the call. A macro that exists in
- *    one build configuration only (CMSIS's `__DSB()` is a macro under the
- *    ARM compilers and an inline function under GCC; a target's compat header
- *    redefines a HAL call) still lets the call bind to the function the other
- *    configuration compiles — dropping those cost a firmware tree hundreds of
- *    real edges, while the fabricated edge #1838 describes comes from an
- *    unconditional macro.
- * Summaries stay small even for vendor headers with tens of thousands of
- * object-like defines, which is what keeps a large firmware tree indexable.
+ * Directive summaries are cached per file, but evaluated in translation-unit
+ * order on every inclusion. Only #pragma once and actual guard state suppress
+ * reinclusion; an active recursion stack breaks include cycles. Unknown build
+ * flags remain possible, so only definite macro visibility suppresses a call.
+ * Object-like definitions participate in conditions but never enter the cached
+ * call-site timelines (vendor headers can contain tens of thousands of them).
  */
 import * as path from 'path';
+import { maskCppRawStrings } from '../extraction/languages/c-cpp';
 import { CPP_DEFINE_SIGNATURE, type ResolutionContext, type UnresolvedRef } from './types';
 import { resolveImportPath } from './import-resolver';
 
 /** Three-valued: true / false / undefined = depends on an unknown build flag. */
 type Truth = boolean | undefined;
 type FileEvent =
-  | { kind: 'define' | 'undef'; name: string; line: number; active: Truth }
-  | { kind: 'include'; quote: string; spec: string; line: number; active: Truth };
+  | { kind: 'define' | 'undef'; name: string; line: number; functionLike: boolean; value: string; wrapsItself: boolean }
+  | { kind: 'include'; quote: string; spec: string; line: number }
+  | { kind: 'branch'; op: string; expression: string; guard: boolean; line: number }
+  | { kind: 'once'; line: number };
 type Event = { line: number; defined: Truth };
 type Cache = {
   summaries: Map<string, FileEvent[]>;
@@ -110,79 +92,30 @@ function cacheFor(context: ResolutionContext): Cache {
   return cache;
 }
 
-/**
- * One pass over a file: its conditional structure evaluated with what the
- * file itself defines, reduced to function-like define / undef events (with
- * the truth of the arm they sit in) and includes.
- */
+/** Cache syntax, never conditional truth: an included file can change its flags. */
 function summarize(file: string, context: ResolutionContext, cache: Cache): FileEvent[] {
   const cached = cache.summaries.get(file);
   if (cached) return cached;
   const events: FileEvent[] = [];
   const lines = directiveLines(context.readFile(file) ?? '');
-  const definitions = new Map<string, { defined: Truth; value: Truth }>();
-  const frames: Array<{ parent: Truth; taken: Truth }> = [];
-  let active: Truth = true;
-
-  const condition = (expression: string): Truth => {
-    const text = expression.trim();
-    if (/^(?:0x[\da-f]+|\d+)[uUlL]*$/i.test(text)) return Number(text.replace(/[uUlL]+$/, '')) !== 0;
-    const def = text.match(/^(!)?\s*defined\s*(?:\(\s*(\w+)\s*\)|(\w+))$/);
-    if (def) {
-      const known = definitions.get(def[2] ?? def[3]!)?.defined;
-      return def[1] ? not(known) : known;
-    }
-    return /^\w+$/.test(text) ? definitions.get(text)?.value : undefined;
-  };
-
   for (let i = 0; i < lines.length; i++) {
     const text = lines[i]!;
-    if (!/^\s*#/.test(text)) continue;
     const branch = text.match(/^\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)$/);
     if (branch) {
-      const op = branch[1];
-      if (op === 'if' || op === 'ifdef' || op === 'ifndef') {
-        const test = op === 'if' ? condition(branch[2]!) : definitions.get(branch[2]!.trim())?.defined;
-        let selected = op === 'ifndef' ? not(test) : test;
-        if (selected === undefined && guardsItself(lines, i, op, branch[2]!)) selected = true;
-        frames.push({ parent: active, taken: selected });
-        active = and(active, selected);
-      } else if (op === 'endif') {
-        active = frames.pop()?.parent ?? true;
-      } else {
-        const frame = frames[frames.length - 1];
-        if (frame) {
-          const test = op === 'else' ? true : condition(branch[2]!);
-          active = and(frame.parent, and(not(frame.taken), test));
-          frame.taken = or(frame.taken, test);
-        }
-      }
+      events.push({ kind: 'branch', op: branch[1]!, expression: branch[2]!,
+        guard: guardsItself(lines, i, branch[1]!, branch[2]!), line: i + 1 });
       continue;
     }
-    if (active === false) continue;
-
     const directive = text.match(/^\s*#\s*(define|undef)\s+(\w+)(\(?)/);
     if (directive) {
-      const name = directive[2]!;
-      const defining = directive[1] === 'define';
-      const functionLike = directive[3] === '(';
-      // A wrapper macro whose body calls the same-named function —
-      // `#define vec_splice(v, s, n) (vec_splice(unpack(v), s, n), …)` — is
-      // how that function gets called; it hides nothing.
-      const wrapsItself = functionLike && callsItself(lines, i, name);
-      // An absent entry is false; an existing unknown must stay unknown.
-      const prior = definitions.get(name)?.defined ?? false;
-      definitions.set(name, {
-        defined: defining ? or(prior, active) : and(prior, not(active)),
-        value: defining && active === true ? condition(text.slice(directive[0].length)) : undefined,
-      });
-      if (!defining || (functionLike && !wrapsItself)) {
-        events.push({ kind: defining ? 'define' : 'undef', name, line: i + 1, active });
-      }
+      events.push({ kind: directive[1] as 'define' | 'undef', name: directive[2]!, line: i + 1,
+        functionLike: directive[3] === '(', value: text.slice(directive[0].length),
+        wrapsItself: directive[3] === '(' && callsItself(lines, i, directive[2]!) });
       continue;
     }
     const include = text.match(/^\s*#\s*include\s*([<"])([^>"]+)[>"]/);
-    if (include) events.push({ kind: 'include', quote: include[1]!, spec: include[2]!, line: i + 1, active });
+    if (include) events.push({ kind: 'include', quote: include[1]!, spec: include[2]!, line: i + 1 });
+    if (/^\s*#\s*pragma\s+once\b/.test(text)) events.push({ kind: 'once', line: i + 1 });
   }
   cache.summaries.set(file, events);
   return events;
@@ -199,7 +132,7 @@ function summarize(file: string, context: ResolutionContext, cache: Cache): File
 function directiveLines(source: string): string[] {
   const out: string[] = [];
   let inBlock = false;
-  for (const raw of source.split(/\r?\n/)) {
+  for (const raw of maskCppRawStrings(source).source.split(/\r?\n/)) {
     let text = raw;
     if (inBlock) {
       const end = text.indexOf('*/');
@@ -319,31 +252,73 @@ function walkTranslationUnit(
   cache: Cache
 ): Map<string, Event[]> {
   const timeline = new Map<string, Event[]>();
-  const defined = new Map<string, Truth>();
-  // A file is walked once — twice when a later include reaches it
-  // unconditionally after a first, conditional one (a diamond).
-  const scanned = new Map<string, Truth>();
-
+  const definitions = new Map<string, { defined: Truth; value: Truth; macro: Truth }>();
+  const scanning = new Set<string>();
+  const macroNames = new Set<string>();
+  const once = new Map<string, Truth>();
+  const condition = (expression: string): Truth => {
+    const text = expression.trim();
+    if (/^(?:0x[\da-f]+|\d+)[uUlL]*$/i.test(text)) return Number(text.replace(/[uUlL]+$/, '')) !== 0;
+    const def = text.match(/^(!)?\s*defined\s*(?:\(\s*(\w+)\s*\)|(\w+))$/);
+    if (def) {
+      const known = definitions.get(def[2] ?? def[3]!)?.defined;
+      return def[1] ? not(known) : known;
+    }
+    return /^\w+$/.test(text) ? definitions.get(text)?.value : undefined;
+  };
   const scan = (file: string, inherited: Truth, includeLine?: number): void => {
-    if (scanned.has(file) && (scanned.get(file) === true || inherited !== true)) return;
-    scanned.set(file, inherited);
+    if (inherited === false || scanning.has(file) || once.get(file) === true) return;
+    scanning.add(file);
+    let active: Truth = inherited;
+    const frames: Array<{ parent: Truth; taken: Truth }> = [];
     for (const ev of summarize(file, context, cache)) {
       const line = includeLine ?? ev.line;
-      // An include under `#ifdef __GNUC__` brings its definitions in as
-      // "possible", exactly like a define under that guard.
-      const active = and(inherited, ev.active);
+      if (ev.kind === 'branch') {
+        if (ev.op === 'if' || ev.op === 'ifdef' || ev.op === 'ifndef') {
+          const known = definitions.get(ev.expression.trim())?.defined;
+          let selected = ev.op === 'if' ? condition(ev.expression) : ev.op === 'ifndef' ? not(known) : known;
+          if (selected === undefined && ev.guard) selected = true;
+          frames.push({ parent: active, taken: selected });
+          active = and(active, selected);
+        } else if (ev.op === 'endif') {
+          active = frames.pop()?.parent ?? inherited;
+        } else {
+          const frame = frames[frames.length - 1];
+          if (frame) {
+            const test = ev.op === 'else' ? true : condition(ev.expression);
+            active = and(frame.parent, and(not(frame.taken), test));
+            frame.taken = or(frame.taken, test);
+          }
+        }
+        continue;
+      }
+      if (active === false) continue;
+      if (ev.kind === 'once') {
+        once.set(file, or(once.get(file) ?? false, active));
+        continue;
+      }
       if (ev.kind === 'include') {
         const target = resolveInclude(file, ev.quote, ev.spec, language, context, cache);
         if (target) scan(target, active, line);
         continue;
       }
-      const prior = defined.get(ev.name) ?? false;
-      const now = ev.kind === 'define' ? or(prior, active) : and(prior, not(active));
-      defined.set(ev.name, now);
-      const events = timeline.get(ev.name) ?? [];
-      events.push({ line, defined: now });
-      timeline.set(ev.name, events);
+      const prior = definitions.get(ev.name);
+      const defining = ev.kind === 'define';
+      const macro = defining && ev.functionLike && !ev.wrapsItself;
+      const now = active === true ? macro : prior?.macro === macro ? macro : undefined;
+      definitions.set(ev.name, {
+        defined: defining ? or(prior?.defined ?? false, active) : and(prior?.defined ?? false, not(active)),
+        value: defining && active === true ? condition(ev.value) : undefined,
+        macro: now,
+      });
+      if (ev.functionLike) macroNames.add(ev.name);
+      if (macroNames.has(ev.name)) {
+        const events = timeline.get(ev.name) ?? [];
+        events.push({ line, defined: now });
+        timeline.set(ev.name, events);
+      }
     }
+    scanning.delete(file);
   };
 
   scan(rootFile, true);

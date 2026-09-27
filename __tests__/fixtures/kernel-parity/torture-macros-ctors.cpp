@@ -3,7 +3,7 @@
 /// signatures, and the per-declarator constructor refs of local object
 /// initialization — default, direct, brace, multi-declarator, qualified and
 /// template types — beside the declarators that construct nothing (pointer,
-/// reference, array, most-vexing-parse, extern). Must parse ERROR-FREE.
+/// reference, most-vexing-parse, extern). Must parse ERROR-FREE.
 #define TRACE_POINT(value) ((void)(value))
 #define VERSION 7
 
@@ -56,7 +56,7 @@ void non_constructions(Widget &other) {
   Widget &reference{other};
   Widget &bound(other);
   Widget most_vexing();
-  Widget items[2]{};
+  Widget items[2]{}; // array elements do construct objects
   Widget *table[2]{};
   Widget (*callback)(){};
   extern Widget external;
