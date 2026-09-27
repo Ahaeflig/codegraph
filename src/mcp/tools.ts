@@ -51,6 +51,7 @@ import {
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges } from './index-freshness';
+import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
   EXPLORE_EMISSION_KEY,
@@ -1196,6 +1197,9 @@ export interface ToolResult {
    * {@link EXPLORE_EMISSION_KEY}; the two must stay in sync.
    */
   _cgExploreEmission?: ExploreEmission;
+  /** Internal structured provenance, preserved by query workers and stripped by execute. */
+  _cgAnswerFiles?: AnswerFile[];
+  structuredContent?: Record<string, unknown>;
 }
 
 /**
@@ -2101,18 +2105,6 @@ export class ToolHandler {
   private driftCache = new Map<string, { at: number; stale: boolean }>();
   private static readonly DRIFT_TTL_MS = 2000;
   /**
-   * Tools whose answer is read off the graph of the files it names, and so is
-   * refused like explore's when one of those files changed while auto-sync was
-   * off (#1959). codegraph_node is absent on purpose: its drift gate already
-   * serves a changed file's current bytes instead of the indexed slice (#1474).
-   */
-  private static readonly GRAPH_ANSWER_TOOLS = new Set([
-    'codegraph_search', 'codegraph_callers', 'codegraph_callees', 'codegraph_impact',
-  ]);
-  /** Bounds the per-call hashing a degraded-index check may do. */
-  private static readonly MAX_ANSWER_PATHS = 200;
-
-  /**
    * On-disk drift check for a single indexed file (issue #1474). The code
    * renderers slice CURRENT bytes at INDEXED line ranges; when the file
    * changed after its last index sync those ranges can point at a DIFFERENT
@@ -2135,7 +2127,7 @@ export class ToolHandler {
    * are handled by the existing not-found paths, and a wrong "stale" flag
    * would needlessly push the agent back to Read.
    */
-  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string, forceHash = false): boolean {
+  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string): boolean {
     let root: string;
     try {
       root = cg.getProjectRoot();
@@ -2145,7 +2137,7 @@ export class ToolHandler {
     const key = `${root}\0${relPath}`;
     const now = Date.now();
     const hit = this.driftCache.get(key);
-    if (!forceHash && hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
+    if (hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
     let stale = false;
     try {
       const rec = cg.getFile(relPath);
@@ -2154,7 +2146,7 @@ export class ToolHandler {
         const st = statSync(absPath);
         // Same freshness test as the sync fast path (extraction/index.ts):
         // equal size + equal floored mtime ⇒ unchanged, no read needed.
-        if (forceHash || st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
+        if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
           const data = content ?? readFileSync(absPath, 'utf-8');
           // Must stay byte-identical to extraction's `hashContent` (sha256 over
           // the utf-8 string) — the identical-rewrite test in
@@ -2162,26 +2154,21 @@ export class ToolHandler {
           // to keep the extraction module off the MCP startup path.
           stale = createHash('sha256').update(data).digest('hex') !== rec.contentHash;
         }
-      } else if (forceHash) {
-        stale = true; // deleted/inaccessible since this response was rendered
       }
     } catch {
-      stale = forceHash;
+      stale = false;
     }
     this.driftCache.set(key, { at: now, stale });
     return stale;
   }
 
-  /** Indexed files a graph tool's answer names as locations (#1959). */
-  private indexedPathsIn(cg: CodeGraph, result: ToolResult): string[] {
-    const head = result.content[0];
-    if (!head || head.type !== 'text') return [];
-    const found = new Set<string>();
-    for (const [token] of head.text.matchAll(/[\w@$+\-./]+\.\w+/g)) {
-      if (found.size >= ToolHandler.MAX_ANSWER_PATHS) break;
-      if (!found.has(token) && cg.getFile(token)) found.add(token);
-    }
-    return [...found];
+  private answerResult(cg: CodeGraph, text: string, paths: Iterable<string>): ToolResult {
+    const result = this.textResult(text);
+    result._cgAnswerFiles = [...new Set(paths)].map(file => ({
+      path: file,
+      contentHash: cg.getFile(file)?.contentHash ?? null,
+    }));
+    return result;
   }
 
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
@@ -2380,24 +2367,28 @@ export class ToolHandler {
       // keep the main handler's workspace-specific not-indexed guidance.
       const pooled = !!(this.queryPool && this.queryPool.healthy && this.queryPool.ready);
       const projectPath = pooled ? args.projectPath ?? this.cg?.getProjectRoot() : undefined;
+      const wasDegraded = project.isWatcherDegraded?.();
       const raw = (pooled && projectPath)
         ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath })
         : await this.executeReadTool(toolName, dispatchArgs);
-      if (project.isWatcherDegraded?.()) {
-        // Explore reports the files it rendered; the graph tools name theirs as
-        // `path:line` locations in the text (#1959).
-        const answeredFrom = toolName === 'codegraph_explore'
-          ? raw[EXPLORE_EMISSION_KEY]?.files?.map(file => file.path) ?? []
-          : ToolHandler.GRAPH_ANSWER_TOOLS.has(toolName) ? this.indexedPathsIn(project, raw) : [];
-        const stalePaths = answeredFrom.filter(file => this.isFileStaleOnDisk(project, file, undefined, true));
-        if (stalePaths.length > 0) {
-          // Do not show graph/source derived from changed files, and do not
-          // record this rejected emission as source the session has seen.
-          return this.textResult(
-            '⚠️ CodeGraph cannot answer from this index: these files changed after their last sync:\n' +
-            stalePaths.map(file => `- ${file}`).join('\n') +
-            '\nRead those files directly or retry after a successful codegraph sync.'
-          );
+      const answeredFrom = raw._cgAnswerFiles;
+      delete raw._cgAnswerFiles;
+      if (!raw.isError && answeredFrom && (wasDegraded || project.isWatcherDegraded?.())) {
+        const validation = await validateAnswerFiles(project.getProjectRoot(), answeredFrom);
+        if (validation.stale.length || validation.unchecked.length) {
+          // Rejected source must not enter the session's emission history.
+          const lines = ['⚠️ CodeGraph cannot answer from this index:'];
+          if (validation.stale.length) {
+            lines.push('These files changed or became unavailable after their last sync:',
+              ...validation.stale.map(file => `- ${file}`));
+          }
+          if (validation.unchecked.length) {
+            lines.push(`Freshness could not be verified within the validation budget for ${validation.unchecked.length} files:`,
+              ...validation.unchecked.slice(0, 20).map(file => `- ${file}`));
+            if (validation.unchecked.length > 20) lines.push(`- … ${validation.unchecked.length - 20} more (narrow the query)`);
+          }
+          lines.push('Retry after a successful codegraph sync, or narrow the query.');
+          return { ...this.textResult(lines.join('\n')), structuredContent: { freshness: validation } };
         }
       }
       // Record + STRIP before anything else touches the result: the emission is
@@ -2565,7 +2556,7 @@ export class ToolHandler {
     });
 
     const formatted = this.formatSearchResults(ranked);
-    return this.textResult(this.truncateOutput(formatted));
+    return this.answerResult(cg, this.truncateOutput(formatted), ranked.map(r => r.node.filePath));
   }
 
   /**
@@ -2606,6 +2597,7 @@ export class ToolHandler {
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const answerPaths = new Set(groups.flat().map(node => node.filePath));
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -2619,6 +2611,7 @@ export class ToolHandler {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             callers.push(c.node);
+            answerPaths.add(c.node.filePath);
             const label = this.edgeLabel(c.edge);
             if (label) labels.set(c.node.id, label);
           }
@@ -2631,7 +2624,7 @@ export class ToolHandler {
     if (groups.length === 1) {
       const { callers, labels } = collect(groups[0]!);
       if (callers.length === 0) {
-        return this.textResult(`No callers found for "${symbol}"${allMatches.note}${filterNote}`);
+        return this.answerResult(cg, `No callers found for "${symbol}"${allMatches.note}${filterNote}`, answerPaths);
       }
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
@@ -2642,7 +2635,7 @@ export class ToolHandler {
         ? `\n\n> Showing ${limit} of ${callers.length} callers; pass \`limit\` (up to 100) to widen.`
         : '';
       const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + cut + note + filterNote;
-      return this.textResult(this.truncateOutput(formatted));
+      return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
     // Multiple DISTINCT definitions (#764): one section per definition so an
@@ -2667,7 +2660,7 @@ export class ToolHandler {
         lines.push(`- … +${callers.length - limit} more (pass \`limit\` to widen)`);
       }
     }
-    return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
+    return this.answerResult(cg, this.truncateOutput(lines.join('\n') + filterNote), answerPaths);
   }
 
   /**
@@ -2687,6 +2680,7 @@ export class ToolHandler {
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const answerPaths = new Set(groups.flat().map(node => node.filePath));
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -2700,6 +2694,7 @@ export class ToolHandler {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             callees.push(c.node);
+            answerPaths.add(c.node.filePath);
             const label = this.edgeLabel(c.edge);
             if (label) labels.set(c.node.id, label);
           }
@@ -2711,7 +2706,7 @@ export class ToolHandler {
     if (groups.length === 1) {
       const { callees, labels } = collect(groups[0]!);
       if (callees.length === 0) {
-        return this.textResult(`No callees found for "${symbol}"${allMatches.note}${filterNote}`);
+        return this.answerResult(cg, `No callees found for "${symbol}"${allMatches.note}${filterNote}`, answerPaths);
       }
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
@@ -2722,7 +2717,7 @@ export class ToolHandler {
         ? `\n\n> Showing ${limit} of ${callees.length} callees; pass \`limit\` (up to 100) to widen.`
         : '';
       const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + cut + note + filterNote;
-      return this.textResult(this.truncateOutput(formatted));
+      return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
     // Multiple DISTINCT definitions (#764): per-definition sections.
@@ -2745,7 +2740,7 @@ export class ToolHandler {
         lines.push(`- … +${callees.length - limit} more (pass \`limit\` to widen)`);
       }
     }
-    return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
+    return this.answerResult(cg, this.truncateOutput(lines.join('\n') + filterNote), answerPaths);
   }
 
   /**
@@ -2765,6 +2760,7 @@ export class ToolHandler {
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const answerPaths = new Set(groups.flat().map(node => node.filePath));
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -2777,6 +2773,7 @@ export class ToolHandler {
         const impact = cg.getImpactRadius(node.id, depth);
         for (const [id, n] of impact.nodes) {
           mergedNodes.set(id, n);
+          answerPaths.add(n.filePath);
         }
         for (const e of impact.edges) {
           const key = `${e.source}->${e.target}:${e.kind}`;
@@ -2792,7 +2789,7 @@ export class ToolHandler {
     // Single definition (or same-file overloads): the familiar merged report.
     if (groups.length === 1) {
       const formatted = this.formatImpact(symbol, impactOf(groups[0]!)) + (fileFilter && !filteredOut ? "" : allMatches.note) + filterNote;
-      return this.textResult(this.truncateOutput(formatted));
+      return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
     // Multiple DISTINCT definitions (#764): a blast radius PER definition —
@@ -2809,7 +2806,7 @@ export class ToolHandler {
         this.formatImpact(`${head.qualifiedName} (${head.filePath}${line})`, impactOf(group))
       );
     }
-    return this.textResult(this.truncateOutput(sections.join('\n') + filterNote));
+    return this.answerResult(cg, this.truncateOutput(sections.join('\n') + filterNote), answerPaths);
   }
 
   /**
@@ -3672,9 +3669,9 @@ export class ToolHandler {
       const empty = `No relevant code found for "${query}"${missNote}${explanation}`;
       // Still an explore call, so it is still recorded: an empty answer spends a
       // call against the tier budget even though it emits no source.
-      return this.exploreResult(empty, {
+      return { ...this.textResult(empty), [EXPLORE_EMISSION_KEY]: {
         projectRoot, query, files: [], sourceBytes: 0, responseBytes: empty.length,
-      });
+      } };
     }
 
     // Graph-aware glue: findRelevantContext builds the subgraph from name/text
@@ -6361,23 +6358,20 @@ export class ToolHandler {
       });
       sourceBytes += emitted.bytes;
     }
-    return this.exploreResult(finalText, {
+    // Include graph-only and omitted/deleted files, not just emitted source.
+    const answerPaths = new Set(fileGroups.keys());
+    for (const id of [...flow.pathNodeIds, ...flow.namedNodeIds]) {
+      const node = cg.getNode(id);
+      if (node) answerPaths.add(node.filePath);
+    }
+    const result = this.answerResult(cg, finalText, answerPaths);
+    result[EXPLORE_EMISSION_KEY] = {
       projectRoot,
       query,
       files: emittedFiles,
       sourceBytes,
       responseBytes: finalText.length,
-    });
-  }
-
-  /**
-   * An explore response plus the record of what it emitted (CG-17). The record
-   * rides the result only as far as {@link execute}, which files it into the
-   * calling session's state and deletes it — see {@link EXPLORE_EMISSION_KEY}.
-   */
-  private exploreResult(text: string, emission: ExploreEmission): ToolResult {
-    const result = this.textResult(text);
-    result[EXPLORE_EMISSION_KEY] = emission;
+    };
     return result;
   }
 
@@ -6945,7 +6939,9 @@ export class ToolHandler {
       }
     }
 
-    return this.textResult(lines.join('\n'));
+    return { ...this.textResult(lines.join('\n')), structuredContent: {
+      freshness: { lastIndexedAt, changes, complete: changes !== null },
+    } };
   }
 
   /**

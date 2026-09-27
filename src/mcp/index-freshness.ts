@@ -10,12 +10,15 @@ export interface PendingChangeCounts {
 
 /** `getChangedFiles()` may fall back to a huge filesystem scan (#1959). */
 const MEASURE_TIMEOUT_MS = 8_000;
+let liveMeasurements = 0;
 const active = new Map<string, Promise<PendingChangeCounts | null>>();
 
 export function measurePendingChanges(root: string): Promise<PendingChangeCounts | null> {
   const key = path.resolve(root);
   const existing = active.get(key);
   if (existing) return existing;
+  // Status probes for many projects must not exhaust the shared daemon.
+  if (liveMeasurements >= 2) return Promise.resolve(null);
 
   const pending = runMeasurement(key).finally(() => active.delete(key));
   active.set(key, pending);
@@ -38,14 +41,17 @@ function runMeasurement(root: string): Promise<PendingChangeCounts | null> {
     return Promise.resolve(null);
   }
 
+  liveMeasurements++;
   return new Promise(resolve => {
     let settled = false;
     const finish = (counts: PendingChangeCounts | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      // A worker inside a synchronous Git call may take time to terminate.
+      // Return unknown on deadline, but keep its concurrency slot until exit.
+      void worker.terminate().catch(() => {}).finally(() => { liveMeasurements--; });
       resolve(counts);
-      void worker.terminate().catch(() => {});
     };
     const timer = setTimeout(() => finish(null), MEASURE_TIMEOUT_MS);
     worker.once('message', (value: PendingChangeCounts | null) => {

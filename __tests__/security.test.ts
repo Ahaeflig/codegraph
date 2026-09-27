@@ -425,6 +425,7 @@ describe('MCP Input Validation', () => {
     }));
     const fakeCg = {
       searchNodes: () => many,
+      getFile: () => undefined,
       // Search down-ranks generated files, and since #1500 that verdict comes
       // from the index (path convention ∪ content banner) rather than the
       // filename alone. No database here — none of these paths is generated.

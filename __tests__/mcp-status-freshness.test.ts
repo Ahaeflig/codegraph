@@ -22,7 +22,7 @@ describe('MCP status freshness (#1959)', () => {
     git('config', 'user.email', 'codegraph-test@example.invalid');
     git('add', 'modify.ts', 'remove.ts');
     git('commit', '-qm', 'baseline');
-    cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(root);
     await cg.indexAll();
     handler = new ToolHandler(cg);
   });
@@ -41,7 +41,11 @@ describe('MCP status freshness (#1959)', () => {
     fs.unlinkSync(path.join(root, 'remove.ts'));
     fs.writeFileSync(path.join(root, 'add.ts'), 'export const added = 1;\n');
 
-    const changed = (await handler.execute('codegraph_status', {})).content[0].text;
+    const result = await handler.execute('codegraph_status', {});
+    expect(result.structuredContent).toEqual({ freshness: {
+      lastIndexedAt: cg.getLastIndexedAt(), changes: { added: 1, modified: 1, removed: 1 }, complete: true,
+    } });
+    const changed = result.content[0].text;
     expect(changed).toContain('**Changes since index:** 1 added, 1 modified, 1 removed');
   });
 

@@ -1,19 +1,24 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
 import { ExploreSessionState } from '../src/mcp/explore-session-state';
 import { ToolHandler } from '../src/mcp/tools';
+import { QueryPool } from '../src/mcp/query-pool';
+import { Worker } from 'worker_threads';
 import { __setFsWatchForTests } from '../src/sync/watcher';
 
 describe('a degraded index refuses answers from changed files (#1959)', () => {
   let root: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  let pool: QueryPool | undefined;
 
   beforeEach(async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-stale-refusal-'));
+    fs.mkdirSync(path.join(root, 'folder with spaces'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'folder with spaces/目录 🦀.ts'), 'export function unicodeSymbol() { return 1; }\n');
     fs.writeFileSync(path.join(root, 'alpha.ts'), 'export function alphaOnly() { return 1; }\n');
     fs.writeFileSync(path.join(root, 'beta.ts'), 'export function betaOnly() { return 2; }\n');
     fs.writeFileSync(
@@ -34,7 +39,10 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
     __setFsWatchForTests(null);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await pool?.destroy();
+    pool = undefined;
+    await handler.closeAll();
     __setFsWatchForTests(null);
     try { cg.unwatch(); } catch { /* ignore */ }
     try { cg.close(); } catch { /* ignore */ }
@@ -95,4 +103,52 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
     expect(unaffected.content[0].text).toContain('beta.ts');
     expect(unaffected.content[0].text).not.toContain('cannot answer from this index');
   });
+  it.each([false, true])('preserves spaces and Unicode through provenance (pooled=%s)', async pooled => {
+    if (pooled) {
+      pool = new QueryPool({ root, size: 1, createWorker: () => new Worker(
+        path.resolve(__dirname, '../dist/mcp/query-worker.js'), { workerData: { root } },
+      ) });
+      handler.setQueryPool(pool);
+      await vi.waitFor(() => expect(pool!.ready).toBe(true), { timeout: 15000 });
+    }
+    const relative = 'folder with spaces/目录 🦀.ts';
+    const initial = await handler.execute('codegraph_search', { query: 'unicodeSymbol' });
+    expect(initial.content[0].text).toContain(relative);
+    expect(initial).not.toHaveProperty('_cgAnswerFiles');
+    const before = fs.statSync(path.join(root, relative));
+    fs.writeFileSync(path.join(root, relative), 'export function unicodeSymbol() { return 9; }\n');
+    fs.utimesSync(path.join(root, relative), before.atime, before.mtime);
+    const result = await handler.execute('codegraph_search', { query: 'unicodeSymbol' });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('cannot answer from this index');
+    expect(result.structuredContent).toEqual({ freshness: { stale: [relative], unchecked: [] } });
+    expect(result).not.toHaveProperty('_cgAnswerFiles');
+  });
+
+  it.each(['codegraph_search', 'codegraph_explore', 'codegraph_callers', 'codegraph_callees', 'codegraph_impact'])(
+    'refuses deleted contributing files in %s', async tool => {
+      fs.unlinkSync(path.join(root, 'alpha.ts'));
+      const result = await handler.execute(tool, { query: 'alphaOnly', symbol: 'alphaOnly' });
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('cannot answer from this index');
+      expect(result.content[0].text).toContain('alpha.ts');
+      expect(result).not.toHaveProperty('_cgExploreEmission');
+    },
+  );
+
+  it('refuses rather than silently validating only the first 200 contributing files', async () => {
+    for (let i = 0; i < 201; i++) {
+      fs.writeFileSync(path.join(root, `caller${i}.ts`),
+        `import { alphaOnly } from './alpha'; export function caller${i}() { return alphaOnly(); }\n`);
+    }
+    await cg.indexAll();
+    const raw = await handler.executeReadTool('codegraph_impact', { symbol: 'alphaOnly' });
+    expect(raw._cgAnswerFiles!.length).toBeGreaterThan(200);
+    const result = await handler.execute('codegraph_impact', { symbol: 'alphaOnly' });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('validation budget');
+    expect((result.structuredContent!.freshness as { unchecked: string[] }).unchecked.length).toBeGreaterThan(0);
+    expect(result.content[0].text).not.toContain('**Impact');
+  });
+
 });
