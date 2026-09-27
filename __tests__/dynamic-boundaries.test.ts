@@ -149,6 +149,25 @@ describe('codegraph_explore — dynamic boundaries', () => {
     if (testDir && fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
   });
 
+  it('announces a template import boundary from indexed source (#1967)', async () => {
+    await setup({
+      'loader.ts': [
+        'export async function loadLocale(lang: string) {',
+        '  return import(`./locales/${lang}.js`);',
+        '}',
+      ].join('\n'),
+      'locale.ts': 'export function translate() { return "hello"; }',
+    }, ['**/*.ts']);
+
+    const res = await handler.execute('codegraph_explore', { query: 'loadLocale translate' });
+    const text = res.content[0].text as string;
+    expect(res.isError).not.toBe(true);
+    expect(text).toContain('**Dynamic boundaries');
+    expect(text).toContain('dynamic import');
+    expect(text).toMatch(/loader\.ts:2/);
+    expect(text).not.toContain('candidates for key');
+  });
+
   it('announces the boundary site and shortlists the keyed candidate', async () => {
     await setup({
       'router.ts': [
@@ -416,4 +435,45 @@ describe('scanDynamicDispatch — dynamic import arguments (#1967)', () => {
     expect(forms('function a() {\n  return require("./fixed");\n}')).toEqual([]);
     expect(forms("async function a() {\n  return import('./data.json', { with: { type: 'json' } });\n}")).toEqual([]);
   });
+});
+
+
+describe('scanDynamicDispatch — import escapes and trivia (#1967)', () => {
+  it.each(['import', 'require'])('%s respects escapes and complete literals', (call) => {
+    const staticArgs = [
+      '`./plugins/\\${name}`',
+      '`./plugins/\\\\\\${name}`',
+      '`./plugins/\\`fixed`',
+      '"./plugins/\\"fixed"',
+      "'./plugins/\\'fixed'",
+      '/* before */ `./fixed` /* after */',
+      '// before\n "./fixed" // after\n',
+      '`./fixed`, { with: { type: "json" } }',
+      '"./${name}"',
+    ];
+    for (const arg of staticArgs) {
+      expect(scanDynamicDispatch(`${call}(${arg})`, 'typescript', 1), arg).toEqual([]);
+    }
+    const runtimeArgs = [
+      '`./plugins/\\\\${name}`',
+      '`./plugins/\\${literal}/${name}`',
+      '`./plugins/${`nested-${name}`}`',
+      '/* before */ "./plugins/" /* after */ + name',
+      '`./plugins/\\${literal}` + name',
+      '"./plugins/".concat(name)',
+      '// before\n `./plugins/${name}`, { with: { type: "json" } }',
+    ];
+    for (const arg of runtimeArgs) {
+      const matches = scanDynamicDispatch(`function load() {\n  ${call}(${arg});\n}`, 'typescript', 20);
+      expect(matches, arg).toHaveLength(1);
+      expect(matches[0], arg).toMatchObject({ form: 'dynamic-import', line: 21 });
+    }
+  });
+
+  it.each(['javascript', 'typescript', 'jsx', 'tsx', 'vue', 'svelte', 'astro', 'arkts'])(
+    'detects runtime imports across %s', (language) => {
+      expect(scanDynamicDispatch('import(`./${name}`)', language, 1)[0]?.form).toBe('dynamic-import');
+      expect(scanDynamicDispatch('import(`./fixed`)', language, 1)).toEqual([]);
+    },
+  );
 });

@@ -95,7 +95,13 @@ function isRuntimeImportArgument(stripped: string, original: string, start: numb
   if (quote !== '"' && quote !== "'" && quote !== '`') return true;
   const close = stripped.indexOf(quote, i + 1);
   if (close === -1) return false;
-  if (quote === '`' && original.slice(i + 1, close).includes('${')) return true;
+  if (quote === '`') {
+    for (let k = i + 1; k < close; k++) {
+      // Skip escape pairs: \${ is literal text, but \\${ interpolates.
+      if (original[k] === '\\') { k++; continue; }
+      if (original[k] === '$' && original[k + 1] === '{') return true;
+    }
+  }
   let j = close + 1;
   while (/\s/.test(stripped[j] ?? '')) j++;
   // `)` ends the call; `,` starts import()'s options argument. Anything else
