@@ -8277,6 +8277,10 @@ describe('Nested non-submodule git repos', () => {
       const sources = ['', 'module/'].flatMap((prefix) => ['main', 'test'].flatMap((sourceSet) => [
         `${prefix}src/${sourceSet}/java/com/acme/build/RealtimePlusService.java`,
         `${prefix}src/${sourceSet}/java/build/nested/build/Example.java`,
+      ]).concat([
+        `${prefix}src/androidTest/java/com/acme/build/DeviceProbe.java`,
+        `${prefix}src/main/kotlin/com/acme/build/KotlinProbe.kt`,
+        `${prefix}src/test/scala/com/acme/build/ScalaProbe.scala`,
       ]));
       const ignored = [
         'build/generated/Generated.java',
