@@ -444,7 +444,7 @@ export class TreeSitterExtractor {
     const preceding = getPrecedingDocstring(node, this.source);
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
-    return preceding ?? body;
+    return body || preceding;
   }
 
   private filePath: string;
@@ -578,6 +578,8 @@ export class TreeSitterExtractor {
         isExported: false,
         updatedAt: Date.now(),
       };
+      const fileDocstring = this.extractor?.getBodyDocstring?.(this.tree.rootNode, this.source);
+      if (fileDocstring) fileNode.docstring = fileDocstring;
       this.nodes.push(fileNode);
 
       // Push file node onto stack so top-level declarations get contains edges

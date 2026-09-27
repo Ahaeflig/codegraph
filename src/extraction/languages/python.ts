@@ -22,24 +22,33 @@ export const pythonExtractor: LanguageExtractor = {
    * walk never reached it and the prose never entered the index (#1905).
    *
    * Reads `string_content` rather than slicing quotes off the raw text: the
-   * grammar already separates delimiters from body, which keeps `r`/`u`/`b`
+   * grammar already separates delimiters from body, which keeps `r`/`u`
    * prefixes and both `"""` and `'''` forms working without a regex per case.
-   * f-strings are skipped — an interpolated string is code, not prose.
+   * Bytes and f-strings are not Python docstrings.
    */
   getBodyDocstring: (node, source) => {
-    const body = getChildByField(node, 'body');
+    const body = node.type === 'module' ? node : getChildByField(node, 'body');
     if (!body) return undefined;
-    const first = body.namedChild(0);
+    const first = body.namedChildren.find((c) => c.type !== 'comment');
     if (!first || first.type !== 'expression_statement') return undefined;
-    const literal = first.namedChild(0);
-    if (!literal || literal.type !== 'string') return undefined;
-    // `f"..."` opens with an `f`-prefixed start token; interpolation makes it
-    // an expression whose text is not what the author wrote as prose.
-    const start = literal.namedChild(0)?.type === 'string_start' ? literal.namedChild(0) : null;
-    if (start && /f/i.test(getNodeText(start, source).replace(/['"]/g, ''))) return undefined;
-    const content = literal.namedChildren.find((c) => c.type === 'string_content');
-    const raw = content ? getNodeText(content, source) : undefined;
-    return raw ? dedentDocstring(raw) : undefined;
+    if (first.namedChildCount !== 1 || first.children.some((c) => c.type === ',')) return undefined;
+    let literal = first.namedChild(0);
+    while (literal?.type === 'parenthesized_expression') {
+      literal = literal.namedChildren.find((c) => c.type !== 'comment') ?? null;
+    }
+    if (!literal) return undefined;
+    const strings = literal.type === 'concatenated_string'
+      ? literal.namedChildren.filter((c) => c.type !== 'comment') : [literal];
+    let raw = '';
+    for (const string of strings) {
+      if (string.type !== 'string') return undefined;
+      const start = string.namedChildren.find((c) => c.type === 'string_start');
+      if (!start || /[bf]/i.test(getNodeText(start, source))) return undefined;
+      if (!string.namedChildren.some((c) => c.type === 'string_end')) return undefined;
+      const content = string.namedChildren.find((c) => c.type === 'string_content');
+      if (content) raw += getNodeText(content, source);
+    }
+    return dedentDocstring(raw) || undefined;
   },
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
@@ -84,7 +93,14 @@ export const pythonExtractor: LanguageExtractor = {
  * blank edges, so the stored prose reads the same as a comment-derived one.
  */
 function dedentDocstring(raw: string): string {
-  const lines = raw.split('\n');
+  const lines = raw.replace(/\r\n?/g, '\n').split('\n').map((line) => {
+    let column = 0;
+    return Array.from(line, (char) => {
+      const width = char === '\t' ? 8 - column % 8 : 1;
+      column += width;
+      return char === '\t' ? ' '.repeat(width) : char;
+    }).join('');
+  });
   const rest = lines.slice(1).filter((l) => l.trim().length > 0);
   const indent = rest.length === 0
     ? 0
