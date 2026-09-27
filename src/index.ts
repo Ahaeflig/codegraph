@@ -1114,6 +1114,9 @@ export class CodeGraph {
     try {
       const stat = fs.statSync(path.join(this.projectRoot, filePath));
       return (
+        stat.isFile() &&
+        Number.isFinite(stat.mtimeMs) &&
+        Number.isFinite(tracked.modifiedAt) &&
         stat.size === tracked.size &&
         Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)
       );

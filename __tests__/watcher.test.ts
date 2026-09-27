@@ -19,6 +19,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'events';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -30,6 +31,9 @@ import {
   type WatchOptions,
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
+
+// Keep real filesystem operations, with writable exports for failure injection.
+vi.mock('fs', async (importOriginal) => ({ ...await importOriginal<typeof import('fs')>() }));
 
 type SyncFn = (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
 
@@ -1072,6 +1076,86 @@ describe('FileWatcher', () => {
         expect(cg.getPendingFiles().map((p) => p.path)).toContain('src/index.ts');
 
         cg.unwatch();
+      }
+    );
+  });
+
+  describe('Windows indexed metadata guard (#1451)', () => {
+    it.runIf(process.platform === 'win32')('ignores native atime and separate-process read events, then reconciles writes and deletion', async () => {
+      const file = path.join(testDir, 'src', 'index.ts');
+      const cg = initGraph(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      const synced = vi.fn();
+      // Observe real OS delivery through the same stream CodeGraph consumes.
+      // No injected events: a passing negative assertion must see a native event.
+      const nativeWatch = fs.watch;
+      let events = 0;
+      __setFsWatchForTests(((dir: fs.PathLike, options: fs.WatchOptions, listener: fs.WatchListener<string>) =>
+        nativeWatch(dir, options, (event, filename) => {
+          listener(event, filename);
+          if (String(filename).replace(/\\/g, '/') === 'src/index.ts') events++;
+        })) as typeof fs.watch);
+      expect(cg.watch({ debounceMs: 2000, onSyncComplete: synced })).toBe(true);
+      await cg.waitUntilWatcherReady();
+      const before = fs.statSync(file);
+      const quotedFile = file.replace(/'/g, "''");
+      execFileSync('powershell.exe', ['-NoProfile', '-Command',
+        `(Get-Item -LiteralPath '${quotedFile}').LastAccessTimeUtc = [DateTime]::UtcNow.AddDays(-2)`]);
+      await waitFor(() => events > 0, 5000);
+      expect(fs.statSync(file).mtimeMs).toBe(before.mtimeMs);
+      expect(fs.statSync(file).size).toBe(before.size);
+      expect(cg.getPendingFiles()).toEqual([]);
+      events = 0;
+      execFileSync(process.execPath, ['-e', 'require("fs").readFileSync(process.argv[1])', file]);
+      // NTFS can delay/coalesce automatic last-access updates. The explicit
+      // atime event above guarantees native coverage even on such volumes.
+      await new Promise(resolve => setTimeout(resolve, 250));
+      expect(fs.statSync(file).mtimeMs).toBe(before.mtimeMs);
+      expect(fs.statSync(file).size).toBe(before.size);
+      expect(cg.getPendingFiles()).toEqual([]);
+      expect(synced).not.toHaveBeenCalled();
+
+      fs.appendFileSync(file, '\nexport const nativeEdit1451 = true;\n');
+      await waitFor(() => cg.getPendingFiles().some(p => p.path === 'src/index.ts'));
+      await waitFor(() => cg.getNodesByName('nativeEdit1451').length > 0 && !cg.isIndexing(), 8000);
+      await waitFor(() => cg.getPendingFiles().length === 0);
+      fs.unlinkSync(file);
+      await waitFor(() => cg.getPendingFiles().some(p => p.path === 'src/index.ts'));
+      await waitFor(() => cg.getNodesByName('nativeEdit1451').length === 0 && !cg.isIndexing(), 8000);
+    }, 30000);
+
+    it.runIf(process.platform === 'win32').each(['unknown', 'deleted', 'inaccessible', 'unverifiable', 'mtime-only'])(
+      'keeps %s files pending', async (state) => {
+        const file = path.join(testDir, 'src', 'index.ts');
+        const cg = initGraph(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+        await cg.indexAll();
+        cg.watch({ debounceMs: 10000, inertForTests: true });
+        await cg.waitUntilWatcherReady();
+        let relative = 'src/index.ts';
+        if (state === 'unknown') {
+          relative = 'src/new.ts';
+          fs.writeFileSync(path.join(testDir, relative), 'export const newFile = 1;');
+        } else if (state === 'deleted') {
+          fs.unlinkSync(file);
+        } else if (state === 'mtime-only') {
+          const stat = fs.statSync(file);
+          fs.writeFileSync(file, 'export const x = 2;');
+          fs.utimesSync(file, stat.atime, new Date(stat.mtimeMs + 2000));
+        } else {
+          const statSync = fs.statSync;
+          vi.spyOn(fs, 'statSync').mockImplementation(((...args: Parameters<typeof fs.statSync>) => {
+            if (String(args[0]) === file) {
+              if (state === 'inaccessible') throw Object.assign(new Error('access denied'), { code: 'EACCES' });
+              const stat = statSync(file);
+              stat.mtimeMs = NaN;
+              return stat;
+            }
+            return statSync(...args);
+          }) as typeof fs.statSync);
+        }
+        __emitWatchEventForTests(testDir, relative);
+        expect(cg.getPendingFiles().map(p => p.path)).toContain(relative);
+        vi.restoreAllMocks();
       }
     );
   });
