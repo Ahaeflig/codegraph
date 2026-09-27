@@ -145,9 +145,8 @@ export const scalaExtractor: LanguageExtractor = {
       // idiom for `static final` — `object Config { val Timeout = 30 }`), so
       // emit them as `constant`/`variable` like a top-level val, which lets
       // value-reference edges target them. A `class`/`trait`/`enum`/`given` val
-      // is a per-instance immutable field. Both an `object` and a `class`
-      // extract as `class` kind, so the AST node type of the enclosing
-      // definition — not the parent node's kind — is what distinguishes them.
+      // is a per-instance immutable field. Use the AST node type of the enclosing
+      // definition to distinguish them, including given/enum scopes.
       let enclosingDef: string | null = null;
       for (let p = node.parent; p; p = p.parent) {
         if (
