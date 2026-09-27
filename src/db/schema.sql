@@ -200,7 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_ta
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
 -- Sync's third-file wiring lookup must not scan every synthesized edge.
 CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(json_extract(metadata, '$.registeredAt'))
-    WHERE provenance = 'heuristic' AND json_extract(metadata, '$.synthesizedBy') IS NOT NULL;
+    WHERE json_extract(metadata, '$.synthesizedBy') IS NOT NULL;
 
 -- Retain the cheap source-gate verdict when a later sync deletes the source.
 CREATE TABLE IF NOT EXISTS synthesis_inputs (

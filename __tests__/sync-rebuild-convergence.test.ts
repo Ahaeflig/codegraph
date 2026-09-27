@@ -41,6 +41,8 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { createDatabase } from '../src/db/sqlite-adapter';
+import { QueryBuilder } from '../src/db/queries';
+import { ToolHandler } from '../src/mcp/tools';
 
 describe('Incremental sync converges to a full rebuild (CG-33)', () => {
   let testDir: string;
@@ -534,7 +536,7 @@ export function onPing(): void {}
     const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'), { readOnly: true });
     try {
       return db.prepare(`SELECT source, target, kind, metadata, line, col, provenance FROM edges
-        ${synthesized ? "WHERE provenance = 'heuristic' AND json_extract(metadata, '$.synthesizedBy') IS NOT NULL" : ''}
+        ${synthesized ? "WHERE json_extract(metadata, '$.synthesizedBy') IS NOT NULL" : ''}
         ORDER BY source, target, kind, line, col, metadata`).all();
     } finally { db.close(); }
   };
@@ -745,6 +747,64 @@ export function onPing(): void {}
     write('worker.go', 'package demo\nfunc (w Worker) Other() {}\n');
     await cg.sync({ paths: ['worker.go'] });
     expect(readEdges().some(e => JSON.parse(e.metadata).synthesizedBy === 'go-implements')).toBe(false);
+    await converges();
+  });
+
+  it('keeps cross-file Go method containment structural after indexing and incremental refresh', async () => {
+    write('types.go', 'package demo\ntype Worker struct {}\n');
+    write('worker.go', 'package demo\nfunc (w Worker) Run() {}\n');
+    await load();
+    const assertStructural = async () => {
+      const contains = readEdges().filter(e => JSON.parse(e.metadata).synthesizedBy === 'go-method-contains');
+      expect(contains).toHaveLength(1);
+      expect(contains[0].kind).toBe('contains');
+      expect.soft(contains[0].provenance).toBeNull();
+      const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'Worker Run' });
+      expect(result.isError).not.toBe(true);
+      const text = result.content.map(c => c.text ?? '').join('\n');
+      expect(text).toContain('func (w Worker) Run()');
+      expect(text).not.toMatch(/\[dynamic\b/i);
+      const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'), { readOnly: true });
+      try {
+        const queries = new QueryBuilder(db);
+        expect(queries.hasSynthesizedEdgesTouchingFile('types.go')).toBe(true);
+        expect(queries.hasSynthesizedEdgesTouchingFile('worker.go')).toBe(true);
+      } finally { db.close(); }
+    };
+    await assertStructural();
+    // Refresh with both endpoints untouched, then with the method re-extracted.
+    write('unrelated.go', 'package demo\ntype Extra struct {}\n');
+    await cg.sync({ paths: ['unrelated.go'] });
+    await assertStructural();
+    await converges();
+    write('worker.go', 'package demo\n\nfunc (w Worker) Run() {}\n');
+    await cg.sync({ paths: ['worker.go'] });
+    await assertStructural();
+    await converges();
+  });
+
+  it('migrates legacy Go containment ownership without changing provenance', async () => {
+    write('types.go', 'package demo\ntype Worker struct {}\n');
+    write('worker.go', 'package demo\nfunc (w Worker) Run() {}\n');
+    await load();
+    cg.close();
+    const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'));
+    try {
+      db.exec(`DELETE FROM schema_versions WHERE version >= 10;
+        INSERT OR IGNORE INTO schema_versions(version, applied_at, description) VALUES (9, 0, 'legacy fixture');
+        DROP TABLE synthesis_inputs;
+        DROP INDEX idx_edges_synthesis_site;
+        UPDATE edges SET provenance = NULL, metadata = NULL
+          WHERE json_extract(metadata, '$.synthesizedBy') = 'go-method-contains'`);
+    } finally { db.close(); }
+    cg = CodeGraph.openSync(dir);
+    // Inspect the migration itself before sync can replace its output.
+    const migrated = readEdges();
+    expect(migrated).toHaveLength(1);
+    expect(migrated[0].provenance).toBeNull();
+    expect(JSON.parse(migrated[0].metadata).synthesizedBy).toBe('go-method-contains');
+    await cg.sync();
+    expect(readEdges()).toEqual(migrated);
     await converges();
   });
 });

@@ -2,7 +2,8 @@ import { createDatabase, type SqliteDatabase } from './sqlite-adapter';
 import { QueryBuilder } from './queries';
 import { createYielder } from '../resolution/cooperative-yield';
 
-export const SYNTHESIZED_EDGE = "provenance = 'heuristic' AND json_extract(metadata, '$.synthesizedBy') IS NOT NULL";
+// Ownership is independent of provenance: Go method containment is structural.
+export const SYNTHESIZED_EDGE = "json_extract(metadata, '$.synthesizedBy') IS NOT NULL";
 
 /** A private edge overlay: passes see base edges plus their new Go prerequisites. */
 export class SynthesisStage {

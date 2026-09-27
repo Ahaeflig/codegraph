@@ -1878,7 +1878,7 @@ export class QueryBuilder {
 
   /** Must run before file replacement/deletion cascades the endpoint edges. */
   hasSynthesizedEdgesTouchingFile(filePath: string): boolean {
-    const owned = "e.provenance = 'heuristic' AND json_extract(e.metadata, '$.synthesizedBy') IS NOT NULL";
+    const owned = "json_extract(e.metadata, '$.synthesizedBy') IS NOT NULL";
     for (const endpoint of ['source', 'target']) {
       if (this.db.prepare(`SELECT 1 FROM nodes n JOIN edges e ON e.${endpoint} = n.id
         WHERE n.file_path = ? AND ${owned} LIMIT 1`).get(filePath)) return true;

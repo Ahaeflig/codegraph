@@ -889,8 +889,9 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
  *
  * Go guarantees a method's receiver type is declared in the SAME PACKAGE as the
  * method, and a Go package is a single directory — so this is a deterministic
- * structural link: find the same-named type in the method's own directory and
- * add the missing `contains` edge. Tag synthesis ownership so an incremental
+ * structural link, not a heuristic: find the same-named type in the method's
+ * own directory and add the missing `contains` edge with no provenance, matching
+ * same-file extraction. Tag synthesis ownership so an incremental
  * refresh can replace it alongside implicit `implements`. Skips methods that
  * already have a type parent (the same-file case). (#583, cross-file half)
  */
@@ -941,7 +942,7 @@ async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: Ma
     if (seen.has(key)) continue;
     seen.add(key);
     edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine,
-      provenance: 'heuristic', metadata: { synthesizedBy: 'go-method-contains' } });
+      metadata: { synthesizedBy: 'go-method-contains' } });
   }
   return edges;
 }

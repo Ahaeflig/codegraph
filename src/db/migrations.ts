@@ -188,9 +188,8 @@ const migrations: Migration[] = [
           file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(json_extract(metadata, '$.registeredAt'))
-          WHERE provenance = 'heuristic' AND json_extract(metadata, '$.synthesizedBy') IS NOT NULL;
-        UPDATE edges SET provenance = 'heuristic',
-          metadata = json_set(COALESCE(metadata, '{}'), '$.synthesizedBy', 'go-method-contains')
+          WHERE json_extract(metadata, '$.synthesizedBy') IS NOT NULL;
+        UPDATE edges SET metadata = json_set(COALESCE(metadata, '{}'), '$.synthesizedBy', 'go-method-contains')
           WHERE kind = 'contains' AND provenance IS NULL AND EXISTS (
             SELECT 1 FROM nodes s JOIN nodes t ON t.id = edges.target
             WHERE s.id = edges.source AND s.language = 'go' AND t.language = 'go'
