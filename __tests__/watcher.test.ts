@@ -934,89 +934,162 @@ describe('FileWatcher', () => {
       cg.unwatch();
     });
 
-    it('should auto-sync changes inside a symlinked directory (symlink to project dir, #770)', async () => {
-      // Set up a separate "external" project directory
-      const externalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-external-'));
-      const externalSrc = path.join(externalDir, 'src');
-      fs.mkdirSync(externalSrc);
-      fs.writeFileSync(path.join(externalSrc, 'external.ts'), 'export const external = 1;');
+  });
 
-      // Create a symlink inside testDir pointing to the external project
-      const symlinkPath = path.join(testDir, 'linked-project');
-      fs.symlinkSync(externalDir, symlinkPath);
-
-      cg = CodeGraph.initSync(testDir, {
-        config: { include: ['**/*.ts'], exclude: [] },
-      });
+  describe('symlink directory watching (#770)', () => {
+    let cg: CodeGraph | undefined;
+    const externalDirs: string[] = [];
+    const watchers: FileWatcher[] = [];
+    const external = () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-linked-'));
+      externalDirs.push(dir);
+      return dir;
+    };
+    // Junctions exercise Windows directory links without requiring symlink privileges.
+    const link = (target: string, name: string) =>
+      fs.symlinkSync(target, name, process.platform === 'win32' ? 'junction' : 'dir');
+    const has = (name: string) => cg!.getNodesByName(name).length > 0;
+    const start = async () => {
+      cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
       await cg.indexAll();
+      expect(cg.watch({ debounceMs: 100 })).toBe(true);
+      // FSEvents can coalesce writes made while a new stream is being registered.
+      await new Promise(resolve => setTimeout(resolve, 700));
+    };
 
-      const initialStats = cg.getStats();
-      const initialNodes = initialStats.nodeCount;
-
-      cg.watch({ debounceMs: 300 });
-      // Let the watcher install (and discover the symlinked dir) before writing.
-      await new Promise((r) => setTimeout(r, 200));
-
-      // Write to a file inside the symlinked directory — the watcher must pick it up.
-      const symlinkedFile = path.join(symlinkPath, 'src', 'new-in-symlink.ts');
-      fs.writeFileSync(symlinkedFile, 'export function newInSymlink() { return 99; }');
-
-      // Wait for auto-sync to pick it up (OS event delivery + debounce).
-      await waitFor(
-        () => {
-          const stats = cg.getStats();
-          return stats.nodeCount > initialNodes;
-        },
-        8000
-      );
-
-      // The new function inside the symlink should be in the graph.
-      const results = cg.searchNodes('newInSymlink');
-      expect(results.length).toBeGreaterThan(0);
-
-      cg.unwatch();
-
-      // Clean up external dir
-      fs.rmSync(externalDir, { recursive: true, force: true });
+    afterEach(async () => {
+      cg?.unwatch();
+      if (cg) await waitFor(() => !cg!.isIndexing(), 8000);
+      cg?.close();
+      cg = undefined;
+      for (const watcher of watchers.splice(0)) watcher.stop();
+      for (const dir of externalDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+      vi.unstubAllEnvs();
     });
 
-    it('should not crash on symlink cycles (A→B, B→A or A→B→A)', async () => {
-      // Create two dirs with mutual symlinks: dirA/pointsToB → dirB, dirB/pointsToA → dirA
-      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cycle-a-'));
-      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cycle-b-'));
-      const srcA = path.join(dirA, 'src');
-      const srcB = path.join(dirB, 'src');
-      fs.mkdirSync(srcA);
-      fs.mkdirSync(srcB);
-      fs.symlinkSync(srcB, path.join(dirA, 'pointsToB'));
-      fs.symlinkSync(srcA, path.join(dirB, 'pointsToA'));
-      fs.writeFileSync(path.join(srcA, 'a.ts'), 'export const a = 1;');
-      fs.writeFileSync(path.join(srcB, 'b.ts'), 'export const b = 2;');
+    it('auto-syncs edits, creates and deletes through an external directory link', async () => {
+      const dir = external();
+      fs.mkdirSync(path.join(dir, 'src'));
+      const file = path.join(dir, 'src', 'item.ts');
+      fs.writeFileSync(file, 'export function linkedBefore() {}');
+      link(dir, path.join(testDir, 'linked-project'));
+      await start();
+      expect(has('linkedBefore')).toBe(true);
+      fs.writeFileSync(file, 'export function linkedAfter() {}');
+      await waitFor(() => has('linkedAfter') && !has('linkedBefore'), 8000);
+      expect(cg!.getNodesByName('linkedAfter')[0].filePath).toBe('linked-project/src/item.ts');
+      fs.mkdirSync(path.join(dir, 'new'));
+      fs.writeFileSync(path.join(dir, 'new', 'added.ts'), 'export function linkedAdded() {}');
+      await waitFor(() => has('linkedAdded'), 8000);
+      fs.unlinkSync(file);
+      await waitFor(() => !has('linkedAfter'), 8000);
+    }, 30000);
 
-      cg = CodeGraph.initSync(dirA, { config: { include: ['**/*.ts'], exclude: [] } });
-      await cg.indexAll();
+    it('watches both targets of a real cycle and deduplicates aliases', async () => {
+      const a = external();
+      const b = external();
+      link(b, path.join(a, 'toB'));
+      link(a, path.join(b, 'toA'));
+      link(testDir, path.join(a, 'toRoot'));
+      link(a, path.join(testDir, 'linked'));
+      link(a, path.join(testDir, 'duplicate'));
+      await start();
+      fs.writeFileSync(path.join(a, 'a.ts'), 'export function cycleAddedA() {}');
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function cycleAddedB() {}');
+      await waitFor(() => has('cycleAddedA') && has('cycleAddedB'), 8000);
+      expect(cg!.getNodesByName('cycleAddedA')).toHaveLength(1);
+      expect(cg!.getNodesByName('cycleAddedB')).toHaveLength(1);
+    }, 15000);
 
-      const initialNodes = cg.getStats().nodeCount;
+    it('discovers new links, retargets them, removes stale paths and restarts', async () => {
+      const a = external();
+      const b = external();
+      fs.writeFileSync(path.join(a, 'a.ts'), 'export function firstTarget() {}');
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function secondTarget() {}');
+      await start();
+      const alias = path.join(testDir, 'linked');
+      link(a, alias);
+      await waitFor(() => has('firstTarget'), 8000);
+      fs.unlinkSync(alias);
+      link(b, alias);
+      await waitFor(() => has('secondTarget') && !has('firstTarget'), 8000);
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function retargetEdit() {}');
+      await waitFor(() => has('retargetEdit'), 8000);
+      cg!.unwatch();
+      expect(cg!.watch({ debounceMs: 100 })).toBe(true);
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function restartedEdit() {}');
+      await waitFor(() => has('restartedEdit'), 8000);
+      fs.unlinkSync(alias);
+      await waitFor(() => !has('restartedEdit'), 8000);
+    }, 45000);
 
-      cg.watch({ debounceMs: 200 });
-      await new Promise((r) => setTimeout(r, 300));
+    it('refreshes excluded link scope without watching ignored targets', async () => {
+      const dir = external();
+      link(dir, path.join(testDir, 'linked'));
+      fs.writeFileSync(path.join(dir, 'a.ts'), 'export function scopeLinked() {}');
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'linked/\n');
+      await start();
+      expect(has('scopeLinked')).toBe(false);
+      fs.writeFileSync(path.join(testDir, '.gitignore'), '');
+      await waitFor(() => has('scopeLinked'), 8000);
+      fs.writeFileSync(path.join(dir, 'a.ts'), 'export function scopeEdited() {}');
+      await waitFor(() => has('scopeEdited'), 8000);
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'linked/\n');
+      await waitFor(() => !has('scopeEdited'), 8000);
+    }, 30000);
 
-      // Write to both dirs
-      fs.writeFileSync(path.join(srcA, 'newA.ts'), 'export const newA = 3;');
-      fs.writeFileSync(path.join(srcB, 'newB.ts'), 'export const newB = 4;');
+    it('bounds watch handles, skips ignored targets and closes every handle on stop', () => {
+      const dir = external();
+      link(dir, path.join(testDir, 'linked'));
+      link(dir, path.join(testDir, 'duplicate'));
+      link(testDir, path.join(dir, 'cycle'));
+      const ignored = external();
+      link(ignored, path.join(testDir, 'node_modules'));
+      const opened: string[] = [];
+      const closed: string[] = [];
+      __setFsWatchForTests(((dir: fs.PathLike) => {
+        opened.push(String(dir));
+        const w = new EventEmitter() as fs.FSWatcher;
+        w.close = () => { closed.push(String(dir)); };
+        return w;
+      }) as typeof fs.watch);
+      const watcher = new FileWatcher(testDir, async () => ({ filesChanged: 0, durationMs: 0 }));
+      watchers.push(watcher);
+      expect(watcher.start()).toBe(true);
+      expect(opened.some(d => d.includes('node_modules'))).toBe(false);
+      expect(opened.filter(d => fs.realpathSync(d) === fs.realpathSync(dir))).toHaveLength(1);
+      watcher.stop();
+      expect(closed.sort()).toEqual(opened.sort());
+      expect(watcher.start()).toBe(true);
+      watcher.stop();
+      expect(closed.sort()).toEqual(opened.sort());
+    });
 
-      await new Promise((r) => setTimeout(r, 1000));
-
-      cg.unwatch();
-
-      // Should not have crashed, and new files should be indexed
-      const finalNodes = cg.getStats().nodeCount;
-      expect(finalNodes).toBeGreaterThan(initialNodes);
-      const searchResults = cg.searchNodes('newA');
-      expect(searchResults.length).toBeGreaterThan(0);
-
-      fs.rmSync(dirA, { recursive: true, force: true });
-      fs.rmSync(dirB, { recursive: true, force: true });
+    it.runIf(process.platform === 'darwin' || process.platform === 'win32')('caps supplemental recursive streams and degrades on their exhaustion', () => {
+      link(external(), path.join(testDir, 'first'));
+      link(external(), path.join(testDir, 'second'));
+      vi.stubEnv('CODEGRAPH_MAX_DIR_WATCHES', '1');
+      const close = vi.fn();
+      const watch = vi.fn(() => {
+        const w = new EventEmitter() as fs.FSWatcher;
+        w.close = close;
+        return w;
+      });
+      __setFsWatchForTests(watch as typeof fs.watch);
+      const watcher = new FileWatcher(testDir, async () => ({ filesChanged: 0, durationMs: 0 }));
+      watchers.push(watcher);
+      expect(watcher.start()).toBe(true);
+      expect(watch).toHaveBeenCalledTimes(2); // root + capped supplemental stream
+      watcher.stop();
+      expect(close).toHaveBeenCalledTimes(2);
+      watch.mockImplementationOnce(() => {
+        const w = new EventEmitter() as fs.FSWatcher;
+        w.close = close;
+        return w;
+      }).mockImplementation(() => { throw Object.assign(new Error('EMFILE'), { code: 'EMFILE' }); });
+      expect(watcher.start()).toBe(false);
+      expect(watcher.isDegraded()).toBe(true);
+      expect(close).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -1119,6 +1192,29 @@ describe('FileWatcher', () => {
         release();
         await waitFor(() => calls.length >= 2, 4000);
         expect(calls).toEqual([['src/a.ts'], undefined]);
+      } finally {
+        release();
+        watcher.stop();
+      }
+    });
+
+    it('reconciles again when directory topology changes during a full sync', async () => {
+      let release!: () => void;
+      const firstRun = new Promise<void>(resolve => { release = resolve; });
+      const calls: (string[] | undefined)[] = [];
+      const watcher = newWatcher(async paths => {
+        calls.push(paths);
+        if (calls.length === 1) await firstRun;
+        return { filesChanged: 0, durationMs: 1 };
+      }, { debounceMs: 25 });
+      watcher.start();
+      try {
+        __emitWatchEventForTests(testDir, 'removed-link');
+        await waitFor(() => calls.length === 1);
+        __emitWatchEventForTests(testDir, 'another-removed-link');
+        release();
+        await waitFor(() => calls.length === 2);
+        expect(calls).toEqual([undefined, undefined]);
       } finally {
         release();
         watcher.stop();
