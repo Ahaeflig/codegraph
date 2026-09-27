@@ -146,41 +146,59 @@ export class LiquidExtractor {
   ): Array<{ fullMatch: string; groups: string[]; index: number }> {
     const found: Array<{ fullMatch: string; groups: string[]; index: number }> = [];
 
-    /* `{% liquid ... %}` bodies, so the braced pass can skip them. Without this
-       a body that itself contains `{%` (inside a string, say) could be counted
-       twice. */
-    const blocks: Array<{ start: number; end: number; bodyStart: number; body: string }> = [];
-    const liquidTag = /\{%[-]?\s*liquid\b([\s\S]*?)[-]?%\}/g;
-    let block;
-    while ((block = liquidTag.exec(this.source)) !== null) {
-      blocks.push({
-        start: block.index,
-        end: block.index + block[0].length,
-        bodyStart: block.index + block[0].indexOf(block[1]!),
-        body: block[1]!,
-      });
-    }
-
-    const braced = new RegExp(`\\{%[-]?\\s*(${tagPattern})\\s+${argPattern}`, 'g');
-    let match;
-    while ((match = braced.exec(this.source)) !== null) {
-      if (blocks.some((b) => match!.index >= b.start && match!.index < b.end)) continue;
-      found.push({ fullMatch: match[0], groups: match.slice(1) as string[], index: match.index });
+    // Consume complete braced tags so strings and comments cannot start a
+    // second match inside the same tag. Skip non-executing regions entirely.
+    const blocks: Array<{ bodyStart: number; body: string }> = [];
+    const tags = /\{%[-]?\s*(\w+|#)([\s\S]*?)[-]?%\}/g;
+    const braced = new RegExp(`^\\{%[-]?\\s*(${tagPattern})\\s+${argPattern}`);
+    let suppressed: string | undefined;
+    let tag;
+    while ((tag = tags.exec(this.source)) !== null) {
+      const name = tag[1]!;
+      if (suppressed) {
+        if (name === `end${suppressed}`) suppressed = undefined;
+        continue;
+      }
+      if (name === 'comment' || name === 'raw') {
+        suppressed = name;
+        continue;
+      }
+      if (name === 'liquid') {
+        blocks.push({
+          bodyStart: tag.index + tag[0].indexOf(name) + name.length,
+          body: tag[2]!,
+        });
+        continue;
+      }
+      const match = braced.exec(tag[0]);
+      if (match) {
+        found.push({ fullMatch: match[0], groups: match.slice(1) as string[], index: tag.index });
+      }
     }
 
     /* Inside a `{% liquid %}` body each tag starts its own line. Anchoring on
-       the line start is what keeps `render` in `{{ product | render_as }}` or
-       in an inline `#` comment from being read as a tag. */
-    const bare = new RegExp(`^[ \\t]*(${tagPattern})\\s+${argPattern}`, 'gm');
+       the line start keeps prose, filters and inline `#` comments out. */
+    const bare = new RegExp(`^[ \\t]*(${tagPattern})[ \\t]+${argPattern}`);
     for (const b of blocks) {
-      let inner;
-      const re = new RegExp(bare.source, 'gm');
-      while ((inner = re.exec(b.body)) !== null) {
-        found.push({
-          fullMatch: inner[0].trimStart(),
-          groups: inner.slice(1) as string[],
-          index: b.bodyStart + inner.index + (inner[0].length - inner[0].trimStart().length),
-        });
+      let offset = b.bodyStart;
+      let suppressed: string | undefined;
+      for (const line of b.body.split('\n')) {
+        const name = /^[ \t]*(\w+)/.exec(line)?.[1];
+        if (suppressed) {
+          if (name === `end${suppressed}`) suppressed = undefined;
+        } else if (name === 'comment' || name === 'raw') {
+          suppressed = name;
+        } else {
+          const inner = bare.exec(line);
+          if (inner) {
+            found.push({
+              fullMatch: inner[0].trimStart(),
+              groups: inner.slice(1) as string[],
+              index: offset + (inner[0].length - inner[0].trimStart().length),
+            });
+          }
+        }
+        offset += line.length + 1;
       }
     }
 
