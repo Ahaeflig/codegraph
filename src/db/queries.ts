@@ -1878,15 +1878,15 @@ export class QueryBuilder {
 
   /** Must run before file replacement/deletion cascades the endpoint edges. */
   hasSynthesizedEdgesTouchingFile(filePath: string): boolean {
-    const owned = "json_extract(e.metadata, '$.synthesizedBy') IS NOT NULL";
+    const owned = "CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.synthesizedBy') END IS NOT NULL";
     for (const endpoint of ['source', 'target']) {
       if (this.db.prepare(`SELECT 1 FROM nodes n JOIN edges e ON e.${endpoint} = n.id
         WHERE n.file_path = ? AND ${owned} LIMIT 1`).get(filePath)) return true;
     }
     // Wiring often lives in a third file, with neither endpoint in it.
     return !!this.db.prepare(`SELECT 1 FROM edges e WHERE ${owned}
-      AND json_extract(e.metadata, '$.registeredAt') >= ?
-      AND json_extract(e.metadata, '$.registeredAt') < ? LIMIT 1`
+      AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.registeredAt') END >= ?
+      AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.registeredAt') END < ? LIMIT 1`
     ).get(`${filePath}:`, `${filePath};`);
   }
 
