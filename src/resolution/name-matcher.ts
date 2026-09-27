@@ -1020,7 +1020,9 @@ export function resolveObjectLiteralMember(
   const accepts = ref.referenceKind === 'calls' ? callable : valueMember;
 
   const inside = inFile.filter((n) => n.id !== container.id && rangeWithin(n, container));
-  let candidates = inside.filter((n) => n.name === member && accepts(n));
+  const property = objectLiteralProperty(container, member, context);
+  if (property === null || property?.binding) return null;
+  let candidates = inside.filter((n) => n.name === member && accepts(n) && (!property || property.contains(n)));
   if (candidates.length === 0) return null;
 
   // Drop a candidate nested inside ANOTHER callable's body within the literal
@@ -1063,54 +1065,76 @@ export function objectLiteralMemberBinding(
   member: string,
   context: ResolutionContext,
 ): string | null {
-  if (!/^[A-Za-z_$][\w$]*$/.test(member)) return null;
-  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
-  if (!lines) return null;
-  const extent = lines.slice(container.startLine - 1, container.endLine).join('\n');
-  const code = blankStringContents(stripCommentsForRegex(extent, 'typescript'));
-  const open = /=\s*\{/.exec(code);
-  if (!open) return null;
+  return objectLiteralProperty(container, member, context)?.binding ?? null;
+}
 
-  // Split the literal's body into its top-level members.
-  const members: string[] = [];
+/** The last own property wins; an unknown spread/computed key invalidates earlier evidence. */
+function objectLiteralProperty(
+  container: Node,
+  member: string,
+  context: ResolutionContext,
+): { binding: string | null; contains: (node: Node) => boolean } | null | undefined {
+  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
+  if (!lines) return undefined;
+  const extentLines = lines.slice(container.startLine - 1, container.endLine);
+  if (!extentLines.length) return undefined;
+  extentLines[extentLines.length - 1] = extentLines[extentLines.length - 1]!.slice(0, container.endColumn);
+  extentLines[0] = extentLines[0]!.slice(container.startColumn);
+  const extent = stripCommentsForRegex(extentLines.join('\n'), 'typescript');
+  const code = blankStringContents(extent);
+  // Start at THIS declarator, including its columns, never a sibling on the same line.
+  const open = /^[^=]*=\s*(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
+  if (!open) return undefined;
+
+  const members: Array<{ start: number; end: number }> = [];
   let depth = 0;
-  let start = open.index + open[0].length;
+  let start = open[0].length;
   for (let i = start; i < code.length; i++) {
     const ch = code[i];
     if (ch === '{' || ch === '(' || ch === '[') depth++;
     else if (ch === ')' || ch === ']') depth--;
     else if (ch === '}') {
       if (depth === 0) {
-        members.push(code.slice(start, i));
+        members.push({ start, end: i });
         break;
       }
       depth--;
     } else if (ch === ',' && depth === 0) {
-      members.push(code.slice(start, i));
+      members.push({ start, end: i });
       start = i + 1;
     }
   }
 
-  const pair = /^([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)$/;
-  for (const raw of members) {
-    const text = raw.trim();
-    if (text === member) return member;
-    const m = pair.exec(text);
-    if (m && m[1] === member) return m[2]!;
+  let selected: { start: number; end: number; binding: string | null } | null = null;
+  for (const part of members) {
+    const text = extent.slice(part.start, part.end).trim();
+    if (/^(?:\.\.\.|\[)/.test(text)) { selected = null; continue; }
+    const key = /^(?:(?:async|get|set)\s+)?\*?\s*(?:([A-Za-z_$][\w$]*)|['"]([^'"\\]*)['"])(?=\s*(?:[:(<,=]|$))/.exec(text);
+    if ((key?.[1] ?? key?.[2]) !== member) continue;
+    const value = text.slice(key![0].length).trim();
+    const binding = value === '' ? member : /^:\s*([A-Za-z_$][\w$]*)$/.exec(value)?.[1] ?? null;
+    selected = { ...part, binding };
   }
-  return null;
+  if (!selected) return null;
+  const offset = (node: Node): number => {
+    let result = node.startColumn - container.startColumn;
+    for (let line = container.startLine; line < node.startLine; line++) result += lines[line - 1]!.length + 1;
+    return result;
+  };
+  const property = selected;
+  return { binding: property.binding, contains: (node) => offset(node) >= property.start && offset(node) < property.end };
 }
 
 /**
- * Same-file half of the namespace-object alias (#1932): `api.getUser()` where
+ * Shared lexical lookup for namespace-object aliases (#1932): `api.getUser()` where
  * `api` is `const api = { getUser }` (or `{ getUser: fetchUser }`) in the
- * caller's own file. The member's function is declared OUTSIDE the literal, so
+ * object's own file. The member's function is declared OUTSIDE the literal, so
  * containment (`resolveObjectLiteralMember`) finds nothing. Follow the binding
  * the member names — a symbol of this file, else one of its imports — unless a
  * parameter or nearer declaration shadows that name where the literal is
  * written (the edge would then name the wrong function).
  */
-function resolveObjectLiteralBinding(
+export function resolveObjectLiteralBinding(
   container: Node,
   member: string,
   ref: UnresolvedRef,
@@ -1118,8 +1142,28 @@ function resolveObjectLiteralBinding(
 ): ResolvedRef | null {
   const binding = objectLiteralMemberBinding(container, member, context);
   if (!binding) return null;
-  const at: UnresolvedRef = { ...ref, line: container.startLine, column: container.startColumn };
-  if (importShadowedAt(binding, at, context, true)) return null;
+  const at: UnresolvedRef = { ...ref, filePath: container.filePath, language: container.language,
+    fromNodeId: container.id, line: container.startLine, column: container.startColumn };
+  const inFile = context.getNodesInFile(container.filePath);
+  if (inFile.some((n) => (n.kind === 'function' || n.kind === 'method') &&
+      rangeWithin(container, n) && n.signature &&
+      hasParameterBinding(`${n.signature} {`, binding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))) return null;
+
+  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
+  if (!lines) return null;
+  const code = blankStringContents(stripCommentsForRegex(lines.join('\n'), 'typescript'));
+  const offsets = [0];
+  for (let i = 0; i < code.length; i++) if (code[i] === '\n') offsets.push(i + 1);
+  const scopeAt = (node: Node): number[] => {
+    const end = (offsets[node.startLine - 1] ?? code.length) + node.startColumn;
+    const scope: number[] = [];
+    for (let i = 0; i < end; i++) {
+      if (code[i] === '{') scope.push(i);
+      else if (code[i] === '}') scope.pop();
+    }
+    return scope;
+  };
+  const scope = scopeAt(container);
 
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
   const accepts =
@@ -1127,15 +1171,18 @@ function resolveObjectLiteralBinding(
       ? callable
       : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
 
-  const local = context
-    .getNodesInFile(container.filePath)
-    .filter(
-      (n) =>
-        n.name === binding && n.id !== container.id && accepts(n) &&
-        !rangeWithin(n, container) && isLexicallyReachable(n, at, context)
-    )
-    .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
-  if (local) return { original: ref, targetNodeId: local.id, confidence: 0.85, resolvedBy: 'instance-method' };
+  const locals = inFile
+    .filter((n) => n.name === binding && n.id !== container.id &&
+      ['function', 'class', 'constant', 'variable', 'component'].includes(n.kind))
+    .map((node) => ({ node, scope: scopeAt(node) }))
+    .filter((entry) => entry.scope.every((position, i) => scope[i] === position))
+    .sort((a, b) => b.scope.length - a.scope.length);
+  // Select the lexical binding BEFORE checking callability: a nearer value
+  // shadows an outer function even if that value cannot be called.
+  const local = locals[0]?.node;
+  if (local) return accepts(local)
+    ? { original: ref, targetNodeId: local.id, confidence: 0.85, resolvedBy: 'instance-method' }
+    : null;
 
   const imported = context.resolveImport?.({ ...at, referenceName: binding });
   const target = imported ? context.getNodeById?.(imported.targetNodeId) : null;
@@ -3322,10 +3369,8 @@ function matchSelectedStoreCall(ref: UnresolvedRef, context: ResolutionContext):
 }
 
 /** Import resolution names the module binding; a nearer parameter or block
- * declaration can shadow that binding at this particular call site.
- * `nestedOnly` ignores top-level declarations — for a name whose module-level
- * declaration is itself the binding being checked. */
-function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionContext, nestedOnly = false): boolean {
+ * declaration can shadow that binding at this particular call site. */
+function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   for (const fn of context.getNodesInFile(ref.filePath)) {
     if ((fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line &&
@@ -3344,10 +3389,7 @@ function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionC
   };
   const scope = stackAt(code.length);
   const declarations = new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}\\b|\\{[^}]*\\b${escaped}\\b)`, 'g');
-  return [...code.matchAll(declarations)].some(m => {
-    const at = stackAt(m.index!);
-    return (!nestedOnly || at.length > 0) && at.every((p, i) => scope[i] === p);
-  });
+  return [...code.matchAll(declarations)].some(m => stackAt(m.index!).every((p, i) => scope[i] === p));
 }
 
 /** Balanced parameter lists also cover function-typed parameters, whose own

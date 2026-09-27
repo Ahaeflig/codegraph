@@ -14,7 +14,7 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
-  objectLiteralMemberBinding,
+  resolveObjectLiteralBinding,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -1892,44 +1892,8 @@ function resolveObjectLiteralAlias(
 ): ResolvedRef | null {
   if (container.kind !== 'constant' && container.kind !== 'variable') return null;
   if (!JS_FAMILY_FILE.test(container.filePath)) return null;
-  const binding = objectLiteralMemberBinding(container, member, context);
-  if (binding === null) return null;
-
-  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
-  const accepts =
-    ref.referenceKind === 'calls'
-      ? callable
-      : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
-
-  // Declared in the object's own file, outside the literal.
-  const local = context
-    .getNodesInFile(container.filePath)
-    .filter((n) => n.name === binding && n.id !== container.id && accepts(n))
-    .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
-  if (local) return { original: ref, targetNodeId: local.id, confidence: 0.9, resolvedBy: 'import' };
-
-  // Imported into the object's file.
-  for (const imp of context.getImportMappings(container.filePath, container.language)) {
-    if (imp.localName !== binding || imp.isNamespace) continue;
-    const resolvedPath = resolveImportPath(imp.source, container.filePath, container.language, context);
-    if (!resolvedPath) continue;
-    const target = findExportedSymbol(
-      resolvedPath,
-      {
-        isDefault: imp.isDefault,
-        isNamespace: false,
-        exportedName: imp.isDefault ? 'default' : imp.exportedName,
-        memberName: null,
-      },
-      container.language,
-      context,
-      new Set()
-    );
-    if (target && accepts(target)) {
-      return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
-    }
-  }
-  return null;
+  const resolved = resolveObjectLiteralBinding(container, member, ref, context);
+  return resolved ? { ...resolved, confidence: 0.9, resolvedBy: 'import' } : null;
 }
 
 function resolveModuleImportToFile(
