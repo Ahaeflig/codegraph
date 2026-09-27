@@ -162,6 +162,8 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
         projectPath: serviceA, query: 'alphaOriginal',
       });
       expect(JSON.stringify(response)).toContain('rebuild is in progress');
+      // Expected and temporary: guidance, never a tool error that teaches abandonment.
+      expect(JSON.stringify(response)).not.toContain('"isError":true');
       expect(opened).toHaveLength(0);
       expect(fs.existsSync(path.join(serviceA, '.codegraph/writer.pid'))).toBe(false);
       fs.unlinkSync(fence);

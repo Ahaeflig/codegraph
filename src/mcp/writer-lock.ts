@@ -208,9 +208,20 @@ export function writerLockHeldMessage(
 
 /** Rebuild intent is separate from writer ownership: acquire BEFORE stopping
  * the daemon, so its disconnected proxies cannot reopen SQLite in the gap. */
+/**
+ * An index rebuild (`codegraph index`) owns the database. Expected and brief,
+ * so the MCP layer answers it as guidance, never as a tool error (#1325).
+ */
+export class RebuildInProgressError extends Error {
+  constructor() {
+    super('CodeGraph index rebuild is in progress; retry when it finishes.');
+    this.name = 'RebuildInProgressError';
+  }
+}
+
 export function assertNoRebuild(root: string): void {
   const lock = readWriterLock(root, 'rebuild.pid');
   if (lock && lock.pid !== process.pid && isProcessAlive(lock.pid)) {
-    throw new Error('CodeGraph index rebuild is in progress; retry when it finishes.');
+    throw new RebuildInProgressError();
   }
 }
