@@ -254,6 +254,66 @@ describe('MCP staleness banner — matching whole paths (#1968)', () => {
     expect(text).toMatch(/elsewhere in this project are pending index sync/);
   });
 
+  it.each([
+    'src/app.ts中文.ts',
+    '目录src/app.ts',
+    'src/app.ts@backup.ts',
+    'src/app.ts+backup.ts',
+    'src/app.ts%backup.ts',
+    'src/app.ts,backup.ts',
+    'src/app.ts#backup.ts',
+    'src/app.ts.backup.ts',
+    'src/app.ts/child.ts',
+    '@src/app.ts',
+    'src/app.ts🦀.ts',
+  ])('keeps a pending prefix or suffix out of the banner for %s', async (shown) => {
+    fs.mkdirSync(path.dirname(path.join(testDir, shown)), { recursive: true });
+    fs.writeFileSync(path.join(testDir, shown), 'export function otherView() { return 2; }\n');
+    await cg.indexAll();
+    // A directory can also have a filename-like component; use a root suffix
+    // for that case so the pending file and directory can coexist on disk.
+    await pend(shown.includes('/child') ? 'child.ts' : 'src/app.ts');
+    const text = (await handler.execute('codegraph_search', { query: 'otherView' })).content[0].text;
+    expect(text).toContain(shown);
+    expect(text.startsWith('⚠️')).toBe(false);
+    expect(text).toMatch(/elsewhere in this project are pending index sync/);
+  });
+
+  it.each([
+    'src/app.ts',
+    '**`src/app.ts`**',
+    '**src/app.ts**',
+    '(src/app.ts:12)',
+    'src/app.ts:12:3',
+    'src/app.ts:12-20',
+    '"src/app.ts"',
+    'File: src/app.ts\n',
+    'See src/app.ts.',
+    '`src/app.tsx` then `src/app.ts`',
+    'src/app.ts, src/other.ts',
+    'src/app.ts; src/other.ts',
+  ])('preserves a truthful banner for the rendered reference %s', async (reference) => {
+    await pend('src/app.ts');
+    // Exercise renderer variants through the notice wrapper with the real
+    // index and watcher pending set, without mocking the database.
+    const result = (handler as any).withStalenessNotice({
+      content: [{ type: 'text', text: reference }],
+    });
+    expect(result.content[0].text.startsWith('⚠️')).toBe(true);
+    expect(result.content[0].text).not.toContain('elsewhere in this project');
+  });
+
+  it.each(['src/目录.ts', 'src/app@backup.ts', 'src/app+backup.ts'])(
+    'still warns for an exact Unicode or punctuation path: %s', async (rel) => {
+      fs.writeFileSync(path.join(testDir, rel), 'export function specialView() { return 3; }\n');
+      await cg.indexAll();
+      await pend(rel);
+      const text = (await handler.execute('codegraph_search', { query: 'specialView' })).content[0].text;
+      expect(text.startsWith('⚠️')).toBe(true);
+      expect(text).toContain(rel);
+    },
+  );
+
   it('still names a pending file the response shows', async () => {
     await pend('src/app.tsx');
     const text = (await handler.execute('codegraph_search', { query: 'appView' })).content[0].text;

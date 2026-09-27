@@ -1035,21 +1035,21 @@ function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
 const EPILOGUE_LOST_NOTE = '> (Trailing pointer list omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
 
 /**
- * Whether `text` names `relPath` as a whole path, not as the start or end of a
- * longer one: `src/app.ts` is not in `src/app.tsx`, and `app.ts` is not in
- * `src/app.ts`. A following `.` or `/` only continues the path when a path
- * character comes after it, so `src/app.ts.` at the end of a sentence counts.
+ * Match response delimiters rather than ASCII "path characters": filenames
+ * can contain Unicode, @, +, and other punctuation. Keep line references and
+ * a sentence-ending period, but reject prefixes/suffixes of longer paths.
  */
 function mentionsPath(text: string, relPath: string): boolean {
-  const pathChar = /[\w-]/;
+  const delimiter = /[\s`"'()[\]{}*]/;
   for (let at = text.indexOf(relPath); at !== -1; at = text.indexOf(relPath, at + 1)) {
-    const before = text[at - 1] ?? '';
-    if (pathChar.test(before) || before === '/' || before === '.') continue;
+    if (at > 0 && !delimiter.test(text[at - 1] ?? '')) continue;
     const end = at + relPath.length;
-    const after = text[end] ?? '';
-    if (pathChar.test(after)) continue;
-    if ((after === '.' || after === '/') && pathChar.test(text[end + 1] ?? '')) continue;
-    return true;
+    if (end === text.length || delimiter.test(text[end] ?? '')) return true;
+    const suffix = text.slice(end);
+    if (/^:\d+(?::\d+|[-–]\d+)?(?=$|[\s`"'()[\]{}*])/.test(suffix)) return true;
+    if (/^:(?=$|\s)/.test(suffix)) return true; // file-list label
+    if (/^\.(?=$|\s)/.test(suffix)) return true; // prose punctuation
+    if (/^[,;](?=$|\s)/.test(suffix)) return true; // list separator
   }
   return false;
 }
