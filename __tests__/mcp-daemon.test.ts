@@ -554,7 +554,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       () => second.stderr.some((line) =>
         line.includes('Attached to shared daemon') || line.includes('Shared daemon unavailable')
       ),
-      12000,
+      30000, // The nominal 6s retry loop takes up to 26s on the Windows VM.
       25,
       'the proxy to attach or fall back',
     );
@@ -596,7 +596,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       () => server.stderr.some((line) =>
         line.includes('Attached to shared daemon') || line.includes('Shared daemon unavailable')
       ),
-      12000,
+      30000, // The nominal 6s retry loop takes up to 26s on the Windows VM.
       25,
       'the proxy to attach or fall back',
     );
@@ -616,7 +616,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(toolResponse).toMatchObject({
       error: { message: expect.stringContaining('live legacy daemon') },
     });
-  }, 30000);
+  }, 40000);
 
   it('does not start a fallback writer when the daemon lock is unreadable', async () => {
     const pidPath = path.join(realRoot, '.codegraph', 'daemon.pid');
@@ -627,7 +627,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     sendInitialize(server.child, `file://${tempDir}`, 1);
     await waitFor(
       () => server.stderr.some((line) => line.includes('Shared daemon unavailable')),
-      12000,
+      30000, // The nominal 6s retry loop takes up to 26s on the Windows VM.
       25,
       'the proxy to fall back',
     );
@@ -642,7 +642,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(toolResponse).toMatchObject({
       error: { message: expect.stringContaining('daemon lock could not be read') },
     });
-  }, 30000);
+  }, 40000);
 
   it.each([null, 'daemon', 'fallback'])('proxy falls back to read-only mode on a daemon version mismatch (writer: %s)', async (mode) => {
     const before = await staleIndex(realRoot);
