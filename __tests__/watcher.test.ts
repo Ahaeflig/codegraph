@@ -56,11 +56,22 @@ function waitFor(
 
 describe('FileWatcher', () => {
   let testDir: string;
+  const graphs = new Set<CodeGraph>();
+  const unitWatchers = new Set<FileWatcher>();
+
+  const initGraph = (...args: Parameters<typeof CodeGraph.initSync>) => {
+    const cg = CodeGraph.initSync(...args);
+    graphs.add(cg);
+    return cg;
+  };
 
   // Inert by default — unit tests drive events via __emitWatchEventForTests
   // and never depend on real OS watch delivery.
-  const newWatcher = (syncFn: SyncFn, opts: WatchOptions = {}) =>
-    new FileWatcher(testDir, syncFn, { inertForTests: true, ...opts });
+  const newWatcher = (syncFn: SyncFn, opts: WatchOptions = {}) => {
+    const watcher = new FileWatcher(testDir, syncFn, { inertForTests: true, ...opts });
+    unitWatchers.add(watcher);
+    return watcher;
+  };
 
   beforeEach(() => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-watcher-'));
@@ -70,7 +81,18 @@ describe('FileWatcher', () => {
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // DB mutations become visible before async sync maintenance finishes.
+    // Stop new work and drain it BEFORE closing SQLite or removing the fixture;
+    // nested afterEach hooks run too late to protect this outer cleanup.
+    for (const watcher of unitWatchers) watcher.stop();
+    unitWatchers.clear();
+    for (const cg of graphs) {
+      cg.unwatch();
+      await waitFor(() => !cg.isIndexing(), 8000);
+      cg.close();
+    }
+    graphs.clear();
     __setFsWatchForTests(null); // reset the injected fs.watch seam
     vi.restoreAllMocks();
     if (fs.existsSync(testDir)) {
@@ -482,7 +504,7 @@ describe('FileWatcher', () => {
       fs.mkdirSync(deep, { recursive: true });
       fs.writeFileSync(path.join(deep, 'inner.ts'), 'export const i = 2;');
 
-      const cg = CodeGraph.initSync(testDir);
+      const cg = initGraph(testDir);
       await cg.indexAll();
       const before = cg.getFiles().map((f) => f.path);
       expect(before).toContain('docs/a/b/inner.ts');
@@ -507,7 +529,6 @@ describe('FileWatcher', () => {
       expect(after.some((p) => p.startsWith('docs/'))).toBe(false);
 
       watcher.stop();
-      cg.close();
     });
 
     it('should ignore .codegraph directory changes', async () => {
@@ -865,12 +886,8 @@ describe('FileWatcher', () => {
   describe('CodeGraph integration', () => {
     let cg: CodeGraph;
 
-    afterEach(() => {
-      if (cg) cg.close();
-    });
-
     it('should watch and unwatch via CodeGraph API', async () => {
-      cg = CodeGraph.initSync(testDir, {
+      cg = initGraph(testDir, {
         config: { include: ['**/*.ts'], exclude: [] },
       });
       await cg.indexAll();
@@ -886,7 +903,7 @@ describe('FileWatcher', () => {
     });
 
     it('should stop watching on close', async () => {
-      cg = CodeGraph.initSync(testDir, {
+      cg = initGraph(testDir, {
         config: { include: ['**/*.ts'], exclude: [] },
       });
       await cg.indexAll();
@@ -903,7 +920,7 @@ describe('FileWatcher', () => {
     it('should auto-sync when files change while watching (real fs.watch end-to-end)', async () => {
       // The one test that exercises the genuine native watcher: a real file
       // write must propagate through fs.watch → debounce → sync into the graph.
-      cg = CodeGraph.initSync(testDir, {
+      cg = initGraph(testDir, {
         config: { include: ['**/*.ts'], exclude: [] },
       });
       await cg.indexAll();
@@ -950,17 +967,14 @@ describe('FileWatcher', () => {
       fs.symlinkSync(target, name, process.platform === 'win32' ? 'junction' : 'dir');
     const has = (name: string) => cg!.getNodesByName(name).length > 0;
     const start = async () => {
-      cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+      cg = initGraph(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
       await cg.indexAll();
       expect(cg.watch({ debounceMs: 100 })).toBe(true);
       // FSEvents can coalesce writes made while a new stream is being registered.
       await new Promise(resolve => setTimeout(resolve, 700));
     };
 
-    afterEach(async () => {
-      cg?.unwatch();
-      if (cg) await waitFor(() => !cg!.isIndexing(), 8000);
-      cg?.close();
+    afterEach(() => {
       cg = undefined;
       for (const watcher of watchers.splice(0)) watcher.stop();
       for (const dir of externalDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
