@@ -173,6 +173,15 @@ async function waitProcessExit(pid: number, timeoutMs: number): Promise<boolean>
   return waitFor(() => !isAlive(pid), timeoutMs).then(() => true).catch(() => false);
 }
 
+async function staleIndex(root: string): Promise<Buffer> {
+  fs.writeFileSync(path.join(root, 'app.ts'), 'export function originalSymbol() {}\n');
+  const cg = CodeGraph.openSync(root);
+  try { await cg.indexAll(); } finally { cg.close(); }
+  const before = fs.readFileSync(path.join(root, '.codegraph', 'codegraph.db'));
+  fs.writeFileSync(path.join(root, 'app.ts'), 'export function changedSymbol() {}\n');
+  return before;
+}
+
 describe('Shared MCP daemon (issue #411)', () => {
   let tempDir: string;   // the (possibly symlinked) path processes are spawned with
   let realRoot: string;  // its canonical form — what the daemon keys paths on
@@ -214,9 +223,35 @@ describe('Shared MCP daemon (issue #411)', () => {
       });
       process.kill(pid, 'SIGTERM');
       expect(await waitProcessExit(pid, 1500)).toBe(true);
+      expect(fs.existsSync(path.join(realRoot, '.codegraph', 'writer.pid'))).toBe(false);
     } finally {
       raw.destroy();
     }
+  }, 20000);
+
+  it('a disconnect before client hello leaves no phantom session and the idle reaper exits (#1356)', async () => {
+    const server = spawnServer(tempDir, {
+      CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '800',
+      CODEGRAPH_DAEMON_MAX_IDLE_MS: '0',
+      CODEGRAPH_DAEMON_CLIENT_SWEEP_MS: '0',
+    });
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((l) => l.includes('Attached to shared daemon')), 10000);
+    const pid = await waitFor(() => readLockPid(realRoot), 10000);
+    const raw = net.connect(getDaemonSocketPath(realRoot));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        raw.once('data', () => resolve());
+        raw.once('error', reject);
+      });
+      raw.destroy();
+      server.child.stdin.end();
+      expect(await waitProcessExit(pid, 8000)).toBe(true);
+      expect(readDaemonLog(realRoot)).toContain('Shutting down (idle timeout; clients=0)');
+      expect(fs.existsSync(path.join(realRoot, '.codegraph', 'writer.pid'))).toBe(false);
+    } finally { raw.destroy(); }
   }, 20000);
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {
@@ -483,6 +518,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     fs.writeFileSync(daemonPath, staleDaemonLock);
     fs.writeFileSync(writerPath, staleWriterLock);
 
+    const before = await staleIndex(realRoot);
     const second = spawnServer(tempDir, env);
     servers.push(second);
     sendInitialize(second.child, `file://${tempDir}`, 2);
@@ -514,6 +550,10 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(toolResponse.result?.isError).not.toBe(true);
     expect(JSON.stringify(toolResponse.result)).toContain('CodeGraph Status');
     expect(second.stderr.some((line) => line.includes('Serving reads in-process without auto-sync'))).toBe(true);
+    second.child.stdin.end();
+    await waitFor(() => second.child.exitCode !== null, 5000);
+    expect(fs.readFileSync(path.join(realRoot, '.codegraph', 'codegraph.db'))).toEqual(before);
+    expect(fs.readFileSync(writerPath, 'utf8')).toBe(staleWriterLock);
   }, 50000);
 
   it('does not replace a live legacy lock with a second daemon', async () => {
@@ -578,7 +618,11 @@ describe('Shared MCP daemon (issue #411)', () => {
     });
   }, 30000);
 
-  it('proxy falls back to read-only mode on a daemon version mismatch', async () => {
+  it.each([null, 'daemon', 'fallback'])('proxy falls back to read-only mode on a daemon version mismatch (writer: %s)', async (mode) => {
+    const before = await staleIndex(realRoot);
+    const writerPath = path.join(realRoot, '.codegraph', 'writer.pid');
+    const writer = JSON.stringify({ pid: process.pid, mode, startedAt: Date.now() });
+    if (mode) fs.writeFileSync(writerPath, writer);
     const net = await import('net');
     const sockPath = getDaemonSocketPath(realRoot);
     // Plant a live-pid lockfile so the launcher treats the lock as held, and a
@@ -621,8 +665,13 @@ describe('Shared MCP daemon (issue #411)', () => {
       expect(toolResponse.error).toBeUndefined();
       expect(toolResponse.result?.isError).not.toBe(true);
       expect(JSON.stringify(toolResponse.result)).toContain('CodeGraph Status');
-      expect(fs.existsSync(path.join(realRoot, '.codegraph', 'writer.pid'))).toBe(false);
-      expect(server.stderr.some((l) => l.includes('Serving reads in-process without auto-sync: live daemon PID'))).toBe(true);
+      expect(fs.existsSync(writerPath)).toBe(mode !== null);
+      expect(server.stderr.some((l) => l.includes('Serving reads in-process without auto-sync:'))).toBe(true);
+      server.child.stdin.end();
+      await waitFor(() => server.child.exitCode !== null, 5000);
+      expect(fs.readFileSync(path.join(realRoot, '.codegraph', 'codegraph.db'))).toEqual(before);
+      expect(readLockPid(realRoot)).toBe(process.pid);
+      if (mode) expect(fs.readFileSync(writerPath, 'utf8')).toBe(writer);
     } finally {
       await new Promise<void>((resolve) => miniServer.close(() => resolve()));
     }

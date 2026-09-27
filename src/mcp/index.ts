@@ -91,20 +91,20 @@ const TAKEOVER_MAX_RETRIES = 5;
 const TAKEOVER_RETRY_DELAY_MS = 100;
 
 /**
- * Create an in-process fallback only when it cannot conflict with a live
- * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
- * prove that a process owns the legacy writer slot.
- */
-/**
  * A fallback that serves reads without a watcher or a writer lock (#1963).
  * Say so on stderr: otherwise a session that quietly stopped syncing looks
  * the same as a healthy one in the logs.
  */
 function readOnlyFallback(holder: string): MCPEngine {
   process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}.\n`);
-  return new MCPEngine({ watch: false });
+  return new MCPEngine({ readOnly: true });
 }
 
+/**
+ * Create an in-process fallback only when it cannot conflict with a live
+ * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
+ * prove that a process owns the legacy writer slot.
+ */
 function makeFallbackEngine(root: string): MCPEngine {
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
