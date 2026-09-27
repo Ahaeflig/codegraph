@@ -1496,12 +1496,6 @@ export function getStaticTools(): ToolDefinition[] {
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
 
-/**
- * Tool handler that executes tools against a CodeGraph instance
- *
- * Supports cross-project queries via the projectPath parameter.
- * Other projects are opened on-demand and cached for performance.
- */
 /** realpath when the path exists, the path itself otherwise — never throws. */
 function canonicalPath(p: string): string {
   try {
@@ -1525,14 +1519,21 @@ export const MAX_CACHED_PROJECTS = 8;
  * `projectPath` (#1835). `activate` gives it the same treatment the default
  * project gets — a file watcher while it stays open and a catch-up sync — and
  * returns the catch-up promise, which the handler awaits (time-boxed) before
- * the first call against that project. `release` runs when the handler closes
- * the project (LRU eviction or shutdown) so the engine can drop its writer lock.
+ * calls against that project. `release` runs after active calls drain, so the
+ * engine can release shared ownership safely on LRU eviction or shutdown.
  */
 export interface ProjectLifecycle {
+  open(root: string, open: () => CodeGraph): CodeGraph;
   activate(cg: CodeGraph): Promise<void>;
-  release(cg: CodeGraph): void;
+  release(cg: CodeGraph): void | Promise<void>;
 }
 
+/**
+ * Tool handler that executes tools against a CodeGraph instance
+ *
+ * Supports cross-project queries via the projectPath parameter.
+ * Other projects are opened on-demand and cached for performance.
+ */
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries, keyed by the
   // CANONICAL (realpath) index root. Map insertion order doubles as LRU order:
@@ -1541,9 +1542,12 @@ export class ToolHandler {
   // Engine hook that watches + catches up an explicit project (null for the
   // CLI and worker-thread handlers, which never own a watcher).
   private projectLifecycle: ProjectLifecycle | null = null;
-  // Per explicit project: its catch-up sync, awaited once by the first call
-  // that targets it (same time-box as the default project's gate).
+  // Every concurrent call shares its project's pending catch-up promise.
   private projectGates: Map<CodeGraph, Promise<void>> = new Map();
+  private activeCalls = 0;
+  private closing = false;
+  private pendingCloses = 0;
+  private closeWaiters: Array<() => void> = [];
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1567,8 +1571,7 @@ export class ToolHandler {
   // per-file staleness banner can't help, because `getPendingFiles()` is
   // populated by the watcher, not by catch-up. The wait is time-boxed
   // (see {@link resolveCatchUpGateTimeoutMs}) so a minutes-long reconcile on a
-  // huge repo can't hang the first call (#905); cleared on first await so
-  // subsequent calls don't pay any cost.
+  // huge repo can't hang a call (#905); cleared when the reconcile settles.
   private catchUpGate: Promise<void> | null = null;
   // Optional worker-thread pool for off-loop read-tool dispatch. When ready +
   // healthy, heavy reads leave the main loop free for the MCP transport.
@@ -1610,6 +1613,11 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
+    void p?.then(() => {
+      if (this.catchUpGate === p) this.catchUpGate = null;
+    }, () => {
+      if (this.catchUpGate === p) this.catchUpGate = null;
+    });
   }
 
   /**
@@ -1839,10 +1847,8 @@ export class ToolHandler {
     // (#926). The DB connection itself is still cached (by resolved root,
     // below), so re-resolving costs only the stat walk, never a reopen.
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
-    // Canonicalize for the identity checks below only: two spellings of one
-    // root (a symlinked checkout, `/tmp` vs `/private/tmp`) must share one
-    // connection and one watcher (#1835). The instance itself is still opened
-    // at the root as found, so nothing user-visible changes spelling.
+    // Two spellings of one root (a symlinked checkout, `/tmp` vs
+    // `/private/tmp`) must share one connection and one watcher (#1835).
     const canonicalRoot = resolvedRoot ? canonicalPath(resolvedRoot) : null;
 
     if (!resolvedRoot || !canonicalRoot) {
@@ -1881,61 +1887,52 @@ export class ToolHandler {
     // may have been retargeted or recreated since the last call (#1057).
     for (const [root, open] of this.projectCache) {
       if (isSameIndexRoot(root, resolvedRoot)) {
+        this.projectCache.delete(root);
+        this.projectCache.set(root, open);
         return this.freshen(open);
       }
     }
 
-    // Pin the owner to the symlink target, so retargeting the first spelling
-    // cannot move an existing connection onto another cached project.
-    const ownerRoot = realpathSync.native(resolvedRoot);
-    const cg = loadCodeGraph().openSync(ownerRoot);
-    this.projectCache.set(ownerRoot, cg);
-    // Bounded: evict the least recently used explicit project (#1835).
-    while (this.projectCache.size > MAX_CACHED_PROJECTS) {
-      const [oldestKey, oldest] = this.projectCache.entries().next().value as [string, CodeGraph];
-      this.projectCache.delete(oldestKey);
-      this.closeProject(oldest);
-    }
-    // Same lifecycle as the default project: watcher + catch-up sync, owned
-    // by the engine (#1835). The catch-up promise is the project's gate.
-    if (this.projectLifecycle) {
-      let gate: Promise<void>;
-      try {
-        gate = this.projectLifecycle.activate(cg);
-      } catch (err) {
-        gate = Promise.reject(err);
-      }
-      gate = gate.catch(() => { /* logged by the engine; serve best-effort */ });
-      this.projectGates.set(cg, gate);
-    }
+    const open = () => loadCodeGraph().openSync(canonicalRoot);
+    const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
+    this.projectCache.set(canonicalRoot, cg);
+    this.trimProjects();
     return cg;
   }
 
-  /**
-   * Before dispatching a call that names an explicit `projectPath`, wait
-   * (time-boxed, once) for that project's catch-up sync — the same guarantee the
-   * default project's gate gives the first call of a session (#1835). Resolution
-   * errors are left to the dispatch path, which already answers them with the
-   * success-shaped guidance.
-   */
   private async awaitProjectGate(projectPath: string): Promise<void> {
-    let cg: CodeGraph;
-    try {
-      cg = this.getCodeGraph(projectPath);
-    } catch {
-      return;
+    const cg = this.getCodeGraph(projectPath);
+    if (!this.projectLifecycle || cg === this.cg) return;
+    let gate = this.projectGates.get(cg);
+    if (!gate) {
+      gate = this.projectLifecycle.activate(cg).catch(() => { /* engine logs */ });
+      this.projectGates.set(cg, gate);
+      void gate.then(() => {
+        if (this.projectGates.get(cg) === gate) this.projectGates.delete(cg);
+        this.trimProjects();
+      });
     }
-    const gate = this.projectGates.get(cg);
-    if (!gate) return;
-    this.projectGates.delete(cg);
     await this.awaitCatchUpGate(gate);
   }
 
-  /** Close one explicit project: watcher, writer lock (via the engine), DB. */
-  private closeProject(cg: CodeGraph): void {
-    this.projectGates.delete(cg);
-    try { this.projectLifecycle?.release(cg); } catch { /* best-effort */ }
-    try { cg.close(); } catch { /* best-effort */ }
+  /** Never evict a graph while a tool call or its timed-out reconcile uses it. */
+  private trimProjects(): void {
+    if (this.activeCalls > 0) return;
+    for (const [root, cg] of this.projectCache) {
+      if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS) break;
+      if (this.projectGates.has(cg)) continue;
+      this.projectCache.delete(root);
+      if (this.projectLifecycle) {
+        this.pendingCloses++;
+        void Promise.resolve(this.projectLifecycle.release(cg)).finally(() => {
+          this.pendingCloses--;
+          this.trimProjects();
+        });
+      } else cg.close();
+    }
+    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
+      for (const resolve of this.closeWaiters.splice(0)) resolve();
+    }
   }
 
   /**
@@ -1966,15 +1963,12 @@ export class ToolHandler {
   /**
    * Close all cached project connections
    */
-  closeAll(): void {
-    // One key per instance by design; closing through a Set keeps a second
-    // close (which throws on node:sqlite) from ever stopping the loop.
-    for (const cg of new Set(this.projectCache.values())) {
-      this.closeProject(cg);
-    }
-    this.projectCache.clear();
-    this.projectGates.clear();
+  closeAll(): Promise<void> {
+    this.closing = true;
     this.worktreeMismatchCache.clear();
+    this.trimProjects();
+    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
+    return new Promise((resolve) => this.closeWaiters.push(resolve));
   }
 
   /**
@@ -2258,18 +2252,19 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
   ): Promise<ToolResult> {
+    if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
+    this.activeCalls++;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
       // running. The wait is time-boxed (#905): a huge-repo reconcile takes
       // minutes, and blocking the first call on all of it reads as a hang, so
       // we wait briefly then serve and let it finish in the background. The
-      // gate is cleared after first await — subsequent calls pay nothing.
+      // gate stays installed until reconciliation settles, including on timeout.
       // Catch-up failures are logged by the engine; we proceed regardless so a
       // transient sync error never breaks tools.
       if (this.catchUpGate) {
         const gate = this.catchUpGate;
-        this.catchUpGate = null;
         await this.awaitCatchUpGate(gate);
       }
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
@@ -2363,6 +2358,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.activeCalls--;
+      this.trimProjects();
     }
   }
 

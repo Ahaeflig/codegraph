@@ -9,20 +9,23 @@
  * lifecycle the default project gets — a catch-up sync the first call waits
  * for, a watcher while it stays cached — bounded (LRU) and released on stop().
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
+import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { MCPEngine } from '../src/mcp/engine';
-import { __setLoadCodeGraphForTests } from '../src/mcp/tools';
+import { MAX_CACHED_PROJECTS, __setLoadCodeGraphForTests } from '../src/mcp/tools';
 
 const opened: CodeGraph[] = [];
+let onOpen: ((cg: CodeGraph) => void) | undefined;
 /** CodeGraph that records every instance the ToolHandler opens. */
 class RecordingCodeGraph extends CodeGraph {
   static openSync(projectRoot: string): CodeGraph {
     const cg = CodeGraph.openSync(projectRoot);
     opened.push(cg);
+    onOpen?.(cg);
     return cg;
   }
 }
@@ -49,6 +52,8 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
   let serviceA: string;
   let serviceB: string;
   let engine: MCPEngine;
+  const engines: MCPEngine[] = [];
+  const children: ChildProcess[] = [];
   const prevDebounce = process.env.CODEGRAPH_WATCH_DEBOUNCE_MS;
 
   beforeEach(async () => {
@@ -59,19 +64,80 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
     await makeProject(serviceB, 'betaOriginal');
     process.env.CODEGRAPH_WATCH_DEBOUNCE_MS = '100';
     opened.length = 0;
+    onOpen = undefined;
     __setLoadCodeGraphForTests(RecordingCodeGraph as unknown as typeof CodeGraph);
     engine = new MCPEngine({ watch: true });
+    engines.push(engine);
     // Two indexed children, none at the root: no default project (#1607).
     await engine.ensureInitialized(workspace);
   });
 
-  afterEach(() => {
-    engine.stop();
+  afterEach(async () => {
+    await Promise.all(engines.splice(0).map((e) => e.stop()));
+    for (const child of children.splice(0)) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child.once('exit', resolve));
+        child.kill('SIGTERM');
+        await exited;
+      }
+    }
+    vi.restoreAllMocks();
     __setLoadCodeGraphForTests(null);
     if (prevDebounce === undefined) delete process.env.CODEGRAPH_WATCH_DEBOUNCE_MS;
     else process.env.CODEGRAPH_WATCH_DEBOUNCE_MS = prevDebounce;
     fs.rmSync(workspace, { recursive: true, force: true });
   });
+
+  function names(root: string): string[] {
+    const reader = CodeGraph.openSync(root);
+    try { return reader.getNodesByKind('function').map((n) => n.name); }
+    finally { reader.close(); }
+  }
+
+  async function startOwner(mode: 'direct' | 'daemon', slowCatchUp = false): Promise<ChildProcess> {
+    const modulePath = path.resolve(__dirname, '../dist/mcp');
+    const ownerScript = mode === 'daemon' ? `
+      const { Daemon, tryAcquireDaemonLock } = require(process.argv[1] + '/daemon');
+      const root = process.argv[2];
+      tryAcquireDaemonLock(root);
+      const daemon = new Daemon(root, { idleTimeoutMs: 500 });
+      daemon.start().then(() => { if (!process.env.CG_TEST_HOLD_CATCHUP) process.send('ready'); });
+    ` : `
+      const { MCPEngine } = require(process.argv[1] + '/engine');
+      const engine = new MCPEngine();
+      process.on('SIGTERM', async () => { await engine.stop(); process.exit(0); });
+      engine.ensureInitialized(process.argv[2]).then(async () => {
+        await engine.getToolHandler().execute('codegraph_status', {});
+        if (!process.env.CG_TEST_HOLD_CATCHUP) process.send('ready');
+      });
+    `;
+    const script = `
+      if (process.env.CG_TEST_HOLD_CATCHUP) {
+        const CodeGraph = require(process.argv[1] + '/../index').default;
+        const sync = CodeGraph.prototype.sync;
+        CodeGraph.prototype.sync = async function (...args) {
+          process.send('ready');
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          return sync.apply(this, args);
+        };
+      }
+    ` + ownerScript;
+    const child = spawn(process.execPath, ['-e', script, modulePath, serviceA], {
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      env: { ...process.env, CODEGRAPH_NO_DAEMON: mode === 'daemon' ? '0' : '1', CODEGRAPH_QUERY_POOL_SIZE: '0', CG_TEST_HOLD_CATCHUP: slowCatchUp ? '1' : '' },
+    });
+    children.push(child);
+    let stderr = '';
+    child.stderr!.on('data', (chunk) => { stderr += String(chunk); });
+    child.stdout!.resume();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Owner did not start: ${stderr}`)), 10000);
+      child.once('message', () => { clearTimeout(timer); resolve(); });
+      child.once('error', (err) => { clearTimeout(timer); reject(err); });
+      child.once('exit', () => { clearTimeout(timer); reject(new Error(`Owner exited: ${stderr}`)); });
+    });
+    return child;
+  }
 
   async function search(projectPath: string, symbol: string): Promise<string> {
     const res = await engine.getToolHandler().execute('codegraph_search', { query: symbol, projectPath });
@@ -84,6 +150,8 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
     fs.writeFileSync(path.join(serviceA, 'src', 'sample.ts'), 'export function alphaRenamed() { return 1; }\n');
     const first = await search(serviceA, 'alphaRenamed');
     expect(first).toContain('alphaRenamed');
+    expect(names(serviceA)).toContain('alphaRenamed');
+    expect(names(serviceA)).not.toContain('alphaOriginal');
     expect(first).not.toContain('alphaOriginal');
     expect(opened).toHaveLength(1);
     expect(opened[0].isWatching()).toBe(true);
@@ -91,11 +159,11 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
 
     // Edited while the project stays cached — the watcher path.
     fs.writeFileSync(path.join(serviceA, 'src', 'sample.ts'), 'export function alphaWatched() { return 1; }\n');
-    const seen = await waitFor(async () => (await search(serviceA, 'alphaWatched')).includes('alphaWatched'), 10000);
+    const seen = await waitFor(async () => names(serviceA).includes('alphaWatched'), 10000);
     expect(seen).toBe(true);
   });
 
-  it('keeps one watched instance per canonical root and closes it on stop()', async () => {
+  it.runIf(process.platform !== 'win32')('keeps one watched instance per canonical root and closes it on stop()', async () => {
     const link = path.join(workspace, 'link-to-b');
     fs.symlinkSync(serviceB, link, 'dir');
     expect(await search(serviceB, 'betaOriginal')).toContain('betaOriginal');
@@ -105,7 +173,7 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
     expect(opened[0].isWatching()).toBe(true);
     expect(fs.existsSync(path.join(serviceB, '.codegraph', 'writer.pid'))).toBe(true);
 
-    engine.stop();
+    await engine.stop();
     expect(opened[0].isWatching()).toBe(false);
     expect(fs.existsSync(path.join(serviceB, '.codegraph', 'writer.pid'))).toBe(false);
     expect(() => opened[0].getStats()).toThrow();
@@ -119,9 +187,197 @@ describe('MCP explicit projectPath lifecycle (#1835)', () => {
     expect(await search(serviceB, 'betaOriginal')).toContain('betaOriginal');
     expect(opened).toHaveLength(1);
     expect(opened[0].isWatching()).toBe(false);
-    engine.stop();
+    await engine.stop();
     // Not ours — left in place.
     expect(fs.readFileSync(path.join(serviceB, '.codegraph', 'writer.pid'), 'utf8')).toContain(String(process.ppid));
     fs.unlinkSync(path.join(serviceB, '.codegraph', 'writer.pid'));
   });
+
+  it('catches up both children without selecting a default', async () => {
+    for (const [root, symbol] of [[serviceA, 'alphaNew'], [serviceB, 'betaNew']]) {
+      fs.writeFileSync(path.join(root!, 'src/sample.ts'), `export function ${symbol}() {}\n`);
+      await search(root!, symbol!);
+      expect(names(root!)).toEqual([symbol]);
+    }
+    expect(engine.hasDefaultCodeGraph()).toBe(false);
+  });
+
+  it('shares the catch-up gate across concurrent calls and engines', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    onOpen = (cg) => {
+      const sync = cg.sync.bind(cg);
+      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { await held; return sync(...args); });
+    };
+    fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function concurrentNew() {}\n');
+    const second = new MCPEngine();
+    engines.push(second);
+    let completed = 0;
+    const calls = [
+      search(serviceA, 'concurrentNew'),
+      search(path.join(serviceA, 'src'), 'concurrentNew'),
+      second.getToolHandler().execute('codegraph_search', { projectPath: serviceA, query: 'concurrentNew' }),
+    ].map((p) => p.then((r) => { completed++; return r; }));
+    try {
+      await new Promise((r) => setTimeout(r, 100));
+      expect(completed).toBe(0);
+      expect(opened).toHaveLength(1);
+    } finally { release(); }
+    await Promise.all(calls);
+    expect(names(serviceA)).toEqual(['concurrentNew']);
+    expect(opened[0]!.sync).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps watching after one of two engines releases its lease', async () => {
+    const second = new MCPEngine();
+    engines.push(second);
+    await search(serviceA, 'alphaOriginal');
+    await second.getToolHandler().execute('codegraph_search', { projectPath: serviceA, query: 'alphaOriginal' });
+    await opened[0]!.waitUntilWatcherReady(5000);
+    await engine.stop();
+    expect(opened[0]!.isWatching()).toBe(true);
+    expect(fs.existsSync(path.join(serviceA, '.codegraph/writer.pid'))).toBe(true);
+    fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function survivingSession() {}\n');
+    expect(await waitFor(async () => names(serviceA).includes('survivingSession'), 10000)).toBe(true);
+    await second.stop();
+    expect(fs.existsSync(path.join(serviceA, '.codegraph/writer.pid'))).toBe(false);
+  });
+
+  it('retries a foreign writer and catches up after its ownership ends', async () => {
+    const lock = path.join(serviceA, '.codegraph/writer.pid');
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.ppid, mode: 'direct', startedAt: Date.now() }));
+    await search(serviceA, 'alphaOriginal');
+    expect(opened[0]!.isWatching()).toBe(false);
+    fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function afterOwnerExit() {}\n');
+    fs.unlinkSync(lock);
+    // No further query should be necessary to activate the surviving session.
+    expect(await waitFor(async () => names(serviceA).includes('afterOwnerExit'), 10000)).toBe(true);
+    expect(opened[0]!.isWatching()).toBe(true);
+  });
+
+  it('honors no-watch for explicit projects', async () => {
+    await engine.stop();
+    engine = new MCPEngine({ watch: false });
+    engines.push(engine);
+    fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function noWatchEdit() {}\n');
+    await search(serviceA, 'noWatchEdit');
+    expect(names(serviceA)).toEqual(['alphaOriginal']);
+    expect(opened[0]!.isWatching()).toBe(false);
+    expect(fs.existsSync(path.join(serviceA, '.codegraph/writer.pid'))).toBe(false);
+  });
+
+  it('honors the CLI no-watch policy while still catching up on access', async () => {
+    const prev = process.env.CODEGRAPH_NO_WATCH;
+    process.env.CODEGRAPH_NO_WATCH = '1';
+    try {
+      fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function policyCatchUp() {}\n');
+      await search(serviceA, 'policyCatchUp');
+      expect(names(serviceA)).toEqual(['policyCatchUp']);
+      expect(opened[0]!.isWatching()).toBe(false);
+      fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function policyUnwatched() {}\n');
+      await search(serviceA, 'policyUnwatched');
+      expect(names(serviceA)).toEqual(['policyCatchUp']);
+    } finally {
+      if (prev === undefined) delete process.env.CODEGRAPH_NO_WATCH;
+      else process.env.CODEGRAPH_NO_WATCH = prev;
+    }
+  });
+
+  it('defers eviction and shutdown until an active catch-up finishes', async () => {
+    const roots = [serviceA, serviceB];
+    for (let i = roots.length; i <= MAX_CACHED_PROJECTS; i++) {
+      const root = path.join(workspace, `extra-${i}`);
+      await makeProject(root, `symbol${i}`);
+      roots.push(root);
+    }
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    onOpen = (cg) => {
+      if (cg.getProjectRoot() !== serviceA) return;
+      const sync = cg.sync.bind(cg);
+      vi.spyOn(cg, 'sync').mockImplementation(async (...args) => { await held; return sync(...args); });
+    };
+    const prev = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+    process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = '10';
+    try {
+      fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function evictionCatchUp() {}\n');
+      await search(serviceA, 'evictionCatchUp');
+      for (const root of roots.slice(1)) await search(root, 'symbol');
+      expect(() => opened[0]!.getStats()).not.toThrow();
+      expect(() => opened[1]!.getStats()).toThrow();
+      let stopped = false;
+      const stop = engine.stop().then(() => { stopped = true; });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(stopped).toBe(false);
+      expect(() => opened[0]!.getStats()).not.toThrow();
+      release();
+      await stop;
+      expect(names(serviceA)).toEqual(['evictionCatchUp']);
+      expect(() => opened[0]!.getStats()).toThrow();
+      expect(fs.existsSync(path.join(serviceA, '.codegraph/writer.pid'))).toBe(false);
+    } finally {
+      release();
+      if (prev === undefined) delete process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+      else process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = prev;
+    }
+  });
+
+
+  it('drains a tool operation before closing its cached graph', async () => {
+    await search(serviceA, 'alphaOriginal');
+    const handler = engine.getToolHandler();
+    const dispatch = handler.executeReadTool.bind(handler);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    vi.spyOn(handler, 'executeReadTool').mockImplementation(async (...args) => {
+      await held;
+      return dispatch(...args);
+    });
+    const call = search(serviceA, 'alphaOriginal');
+    let stopped = false;
+    const stop = engine.stop().then(() => { stopped = true; });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(stopped).toBe(false);
+      expect(opened[0]!.getStats().fileCount).toBe(1);
+    } finally { release(); }
+    await call;
+    await stop;
+    expect(() => opened[0]!.getStats()).toThrow();
+  });
+
+  it.each(['direct', 'daemon'] as const)('takes over when a real %s owner exits', async (mode) => {
+    fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function ownerCatchUp() {}\n');
+    const owner = await startOwner(mode, true);
+    await search(serviceA, 'ownerCatchUp');
+    expect(names(serviceA)).toEqual(['ownerCatchUp']);
+    expect(opened[0]!.isWatching()).toBe(false);
+    const lock = JSON.parse(fs.readFileSync(path.join(serviceA, '.codegraph/writer.pid'), 'utf8'));
+    expect(lock.pid).toBe(owner.pid);
+    const exited = new Promise((resolve) => owner.once('exit', resolve));
+    owner.kill('SIGTERM');
+    await exited;
+    fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function realOwnerExit() {}\n');
+    expect(await waitFor(async () => names(serviceA).includes('realOwnerExit'), 10000)).toBe(true);
+    expect(opened[0]!.isWatching()).toBe(true);
+  }, 20000);
+
+  it('retains a daemon while either accessing engine remains connected', async () => {
+    const owner = await startOwner('daemon');
+    await search(serviceA, 'alphaOriginal');
+    const second = new MCPEngine();
+    engines.push(second);
+    await second.getToolHandler().execute('codegraph_search', { projectPath: serviceA, query: 'alphaOriginal' });
+    await engine.stop();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(owner.exitCode).toBeNull();
+    expect(owner.signalCode).toBeNull();
+    fs.writeFileSync(path.join(serviceA, 'src/sample.ts'), 'export function retainedDaemon() {}\n');
+    expect(await waitFor(async () => names(serviceA).includes('retainedDaemon'), 10000)).toBe(true);
+    const exited = new Promise((resolve) => owner.once('exit', resolve));
+    await second.stop();
+    await exited;
+    expect(owner.exitCode).toBe(0);
+  }, 20000);
+
 });

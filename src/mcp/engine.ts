@@ -14,10 +14,10 @@ import * as os from 'os';
 import * as path from 'path';
 import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
-import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
 import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
+import { acquireProject, ProjectLease } from './project-lifecycle';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
 // the MCP startup path. It's only needed once a tool actually opens a project —
@@ -79,11 +79,12 @@ export class MCPEngine {
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
-  // Roots of explicit-`projectPath` projects whose writer.pid this engine holds
-  // (#1835) — released when the ToolHandler closes the project or on stop().
-  private explicitWriterLocks: Set<string> = new Set();
+  // Retained synchronization ownership for each cached explicit project.
+  private explicitProjects = new Map<CodeGraph, ProjectLease>();
+  private defaultLease: ProjectLease | null = null;
   private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
   private closed = false;
+  private stopPromise: Promise<void> | null = null;
   // Off-loop read-tool pool. Workers each hold their own WAL read connections;
   // sessions without a default index open projects lazily via projectPath.
   private queryPool: QueryPool | null = null;
@@ -92,7 +93,13 @@ export class MCPEngine {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax };
     this.toolHandler = new ToolHandler(null);
     this.toolHandler.setProjectLifecycle({
-      activate: (cg) => this.activateExplicitProject(cg),
+      open: (root, open) => {
+        if (!this.opts.watch) return open();
+        const lease = acquireProject(root, open, this.watchOptions());
+        this.explicitProjects.set(lease.cg, lease);
+        return lease.cg;
+      },
+      activate: (cg) => this.explicitProjects.get(cg)?.ready() ?? Promise.resolve(),
       release: (cg) => this.releaseExplicitProject(cg),
     });
     if (opts.writerLockRoot) {
@@ -230,13 +237,14 @@ export class MCPEngine {
    * Close everything. Used on graceful daemon shutdown (SIGTERM/idle timeout)
    * and on direct-mode stop. Idempotent.
    */
-  stop(): void {
-    if (this.closed) return;
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
     this.closed = true;
-    if (this.writerLockRoot) {
+    if (!this.cg && !this.initPromise && this.explicitProjects.size === 0 && this.writerLockRoot) {
       releaseWriterLock(this.writerLockRoot);
       this.writerLockRoot = null;
     }
+
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
     this.toolHandler.setQueryPool(null);
@@ -244,61 +252,30 @@ export class MCPEngine {
       void this.queryPool.destroy();
       this.queryPool = null;
     }
-    this.toolHandler.closeAll();
-    for (const root of this.explicitWriterLocks) releaseWriterLock(root);
-    this.explicitWriterLocks.clear();
-    if (this.cg) {
-      try { this.cg.close(); } catch { /* ignore */ }
+    const drained = this.toolHandler.closeAll();
+    this.stopPromise = drained.then(async () => {
+      if (this.initPromise) await this.initPromise;
+      if (this.defaultLease) {
+        await this.defaultLease.release();
+        this.defaultLease = null;
+        this.writerLockRoot = null;
+      } else if (this.cg) {
+        this.cg.unwatch();
+        while (this.cg.isIndexing()) await new Promise((resolve) => setTimeout(resolve, 25));
+        this.cg.close();
+      }
       this.cg = null;
-    }
+      if (this.writerLockRoot) releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
+    });
+    return this.stopPromise;
   }
 
-  /**
-   * Give a project opened for an explicit `projectPath` the default project's
-   * lifecycle (#1835): a file watcher while the ToolHandler keeps it cached and
-   * a catch-up sync now, whose promise the handler awaits before the first call
-   * against it. Only when this engine wins the project's writer lock — if another
-   * live process (its own daemon, say) holds it, that process already syncs the
-   * index and we must not contend for codegraph.lock (#1740). Never throws.
-   */
-  private activateExplicitProject(cg: CodeGraph): Promise<void> {
-    if (this.closed || !this.opts.watch) return Promise.resolve();
-    const root = cg.getProjectRoot();
-    const writer = tryAcquireWriterLock(root, 'fallback');
-    if (writer.kind === 'taken') {
-      process.stderr.write(
-        `[CodeGraph MCP] Not syncing ${root} from this session — ${writerLockHeldMessage(writer.existing, writer.pidPath)}\n`
-      );
-      return Promise.resolve();
-    }
-    this.explicitWriterLocks.add(root);
-
-    const disabledReason = watchDisabledReason(root);
-    if (disabledReason) {
-      process.stderr.write(`[CodeGraph MCP] File watcher disabled for ${root} — ${disabledReason}.\n`);
-    } else if (cg.watch(this.watchOptions())) {
-      process.stderr.write(`[CodeGraph MCP] File watcher active for ${root} (opened via projectPath)\n`);
-    }
-
-    return cg
-      .sync()
-      .then((result) => {
-        const changed = result.filesAdded + result.filesModified + result.filesRemoved;
-        if (changed > 0) {
-          process.stderr.write(`[CodeGraph MCP] Caught up ${changed} file(s) changed in ${root}\n`);
-        }
-      })
-      .catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[CodeGraph MCP] Catch-up sync failed for ${root}: ${msg}\n`);
-      });
-  }
-
-  /** Drop the writer lock of an explicit project the ToolHandler is closing (#1835). */
-  private releaseExplicitProject(cg: CodeGraph): void {
-    const root = cg.getProjectRoot();
-    if (!this.explicitWriterLocks.delete(root)) return;
-    releaseWriterLock(root);
+  private releaseExplicitProject(cg: CodeGraph): void | Promise<void> {
+    const lease = this.explicitProjects.get(cg);
+    this.explicitProjects.delete(cg);
+    if (lease) return lease.release();
+    else cg.close();
   }
 
   /** Watch options shared by the default project and explicit projects. */
@@ -335,7 +312,6 @@ export class MCPEngine {
     };
   }
 
-
   private async doInitialize(searchFrom: string): Promise<void> {
     this.toolHandler.setDefaultProjectHint(searchFrom);
 
@@ -354,7 +330,7 @@ export class MCPEngine {
       this.projectPath = searchFrom;
       this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
       process.stderr.write(
-        `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled.\n`
+        `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
       );
       if (res.candidates.length > 0) {
         const rels = res.candidates.map((c) => path.relative(searchFrom, c) || '.');
@@ -369,7 +345,9 @@ export class MCPEngine {
 
     this.projectPath = resolvedRoot;
     try {
-      this.cg = await loadCodeGraph().open(resolvedRoot);
+      const opened = await loadCodeGraph().open(resolvedRoot);
+      if (this.closed) { opened.close(); return; }
+      this.cg = opened;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
@@ -398,44 +376,12 @@ export class MCPEngine {
   private startWatching(): void {
     if (!this.cg || this.watcherStarted || !this.opts.watch) return;
 
-    // #1740: only one live watcher/writer per project. Daemon and startDirect
-    // usually already hold writer.pid (re-entrant for this pid). Proxy
-    // in-process fallback acquires here; if another writer holds it, skip the
-    // watcher so we never contend on codegraph.lock until auto-sync degrades.
-    const lockRoot = this.projectPath;
-    if (lockRoot) {
-      const writer = tryAcquireWriterLock(lockRoot, 'fallback');
-      if (writer.kind === 'taken') {
-        const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
-        process.stderr.write(
-          `[CodeGraph MCP] File watcher not started — ${msg}\n`
-        );
-        this.watcherStarted = true;
-        return;
-      }
-      this.writerLockRoot = lockRoot;
-    }
-
-    const disabledReason = watchDisabledReason(this.projectPath ?? process.cwd());
-    if (disabledReason) {
-      process.stderr.write(
-        `[CodeGraph MCP] File watcher disabled — ${disabledReason}. ` +
-        `The graph will not auto-update; run \`codegraph sync\` (or install the git sync hooks via \`codegraph init\`) to refresh.\n`
-      );
-      this.watcherStarted = true;
-      return;
-    }
-
-    const started = this.cg.watch(this.watchOptions());
-
+    const opened = this.cg;
+    this.defaultLease = acquireProject(opened.getProjectRoot(), () => opened, this.watchOptions());
+    this.cg = this.defaultLease.cg;
+    if (this.cg !== opened) opened.close();
+    this.toolHandler.setDefaultCodeGraph(this.cg);
     this.watcherStarted = true;
-    if (started) {
-      process.stderr.write('[CodeGraph MCP] File watcher active — graph will auto-sync on changes\n');
-    } else {
-      process.stderr.write(
-        '[CodeGraph MCP] File watcher unavailable on this platform — run `codegraph sync` to refresh the graph after changes.\n'
-      );
-    }
   }
 
   /**
@@ -451,6 +397,10 @@ export class MCPEngine {
   private catchUpSync(): void {
     const cg = this.cg;
     if (!cg) return;
+    if (this.defaultLease) {
+      this.toolHandler.setCatchUpGate(this.defaultLease.ready());
+      return;
+    }
     const p = cg
       .sync()
       .then((result) => {
