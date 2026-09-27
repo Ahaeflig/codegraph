@@ -121,7 +121,7 @@ function makeFallbackEngine(root: string): MCPEngine {
       `Cannot start an in-process fallback while live daemon pid ${existing.pid} holds the project lock.`
     );
   }
-  return new MCPEngine({ writerLockRoot: root });
+  return new MCPEngine({ writerLockRoot: root, queryPool: true });
 }
 
 /**
@@ -428,7 +428,7 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine();
+    this.engine = new MCPEngine({ queryPool: true });
     const transport = new StdioTransport();
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,

@@ -39,12 +39,9 @@ export interface MCPEngineOptions {
    */
   watch?: boolean;
   /**
-   * Whether to off-load read-tool dispatch to a worker-thread pool. Only the
-   * SHARED daemon wants this — it serves many concurrent clients on one event
-   * loop, so without a pool concurrent explores serialize and starve the MCP
-   * transport. Direct mode (one stdio client, no concurrency) leaves it off so a
-   * single call never pays a worker round-trip. `CODEGRAPH_QUERY_POOL_SIZE=0`
-   * disables it even in daemon mode.
+   * Whether to off-load read-tool dispatch to a worker-thread pool. Both daemon
+   * and direct sessions can issue concurrent calls on one event loop.
+   * `CODEGRAPH_QUERY_POOL_SIZE=0` disables it in either mode.
    */
   queryPool?: boolean;
   /**
@@ -78,8 +75,8 @@ export class MCPEngine {
   private writerLockRoot: string | null = null;
   private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot'>>;
   private closed = false;
-  // Off-loop read-tool pool (daemon mode only). Created lazily once the default
-  // project is open — workers each hold their own WAL read connection.
+  // Off-loop read-tool pool. Workers each hold their own WAL read connections;
+  // sessions without a default index open projects lazily via projectPath.
   private queryPool: QueryPool | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
@@ -95,12 +92,12 @@ export class MCPEngine {
   }
 
   /**
-   * Start the worker-thread query pool once a default project is open (daemon
-   * mode only; honors `CODEGRAPH_QUERY_POOL_SIZE`). Idempotent and best-effort:
+   * Start the worker-thread query pool after resolving the default project
+   * (which may be absent). Honors `CODEGRAPH_QUERY_POOL_SIZE`; best-effort:
    * if workers can't spawn on this platform the ToolHandler keeps serving reads
    * in-process, so the pool can only help, never break, tool calls.
    */
-  private maybeStartPool(root: string): void {
+  private maybeStartPool(root: string | null): void {
     if (!this.opts.queryPool || this.queryPool || this.closed) return;
     const size = resolvePoolSize(process.env.CODEGRAPH_QUERY_POOL_SIZE, os.cpus().length);
     if (size <= 0) {
@@ -263,6 +260,7 @@ export class MCPEngine {
           `[CodeGraph MCP] Indexed sub-projects found: ${rels.join(', ')}. Pass \`projectPath\` per call, or launch with --path.\n`
         );
       }
+      this.maybeStartPool(null);
       return;
     }
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
