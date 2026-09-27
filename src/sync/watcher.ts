@@ -578,6 +578,10 @@ export class FileWatcher {
       this.scheduleTreeRefresh();
       return;
     }
+    // Churn under an ignored directory (node_modules, dist, .git) is dropped
+    // before any per-event fs call; `.git/info/exclude` still reaches the scope
+    // refresh in handleChange (#1728).
+    if (rel !== '.git/info/exclude' && this.shouldIgnoreDir(path.dirname(full))) return;
     try {
       if (fs.statSync(full).isDirectory()) {
         if (this.shouldIgnoreDir(full)) return;
