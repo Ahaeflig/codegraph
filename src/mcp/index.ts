@@ -433,6 +433,7 @@ export class MCPServer {
     // mode multiplexes clients; direct mode is single-writer-per-project.
     const writerRoot = resolveDaemonRoot(this.projectPath);
     if (writerRoot) {
+      assertNoRebuild(writerRoot);
       const writer = tryAcquireWriterLock(writerRoot, 'direct');
       if (writer.kind === 'taken') {
         const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
