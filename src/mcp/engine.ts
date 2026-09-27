@@ -79,14 +79,14 @@ export class MCPEngine {
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
-  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot'>>;
+  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
   private closed = false;
   // Off-loop read-tool pool. Workers each hold their own WAL read connections;
   // sessions without a default index open projects lazily via projectPath.
   private queryPool: QueryPool | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
-    this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
+    this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax };
     this.toolHandler = new ToolHandler(null);
     if (opts.writerLockRoot) {
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
