@@ -27,8 +27,8 @@
  * registered function — needs data-flow through struct fields; a wrong edge
  * is worse than none): indirect-call resolution. Member values where the
  * receiver isn't `this`/`self` (`pool.submit(obj.method)`, `Submit(c.store.Fetch)`)
- * ARE captured as `*.method` (#1820) and resolve unique-or-drop to a
- * function/method of that name — same discipline as C ungated tables.
+ * retain their receiver (#1820), so resolution can use type/import scope
+ * before considering a unique method name.
  */
 
 import type { Node as SyntaxNode } from 'web-tree-sitter';
@@ -52,7 +52,8 @@ export interface FnRefCandidate {
    * referenced cross-file WITHOUT imports (global namespace), so the gate
    * can't see them — the strong positional prior (a string argument to
    * `usort`/`array_map`/…) plus resolution's unique-or-drop rule carry the
-   * precision instead.
+   * precision instead. Python/Go member values also skip the name gate,
+   * retaining their receiver for scoped resolution.
    */
   skipGate?: boolean;
 }
@@ -707,13 +708,17 @@ function normalizeSpecial(
       const field = getChildByField(node, 'field');
       if (field) {
         const name = getNodeText(field, source);
-        return name ? [{ name: `*.${name}`, node: field, skipGate: true }] : [];
+        const receiver = getChildByField(node, 'operand');
+        const value = receiver ? `${getNodeText(receiver, source)}.${name}` : '';
+        return /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(value)
+          ? [{ name: value, node: field, skipGate: true }] : [];
       }
       const inner = node.namedChild(0);
       if (!inner) return [];
       if (inner.type === 'identifier' || inner.type === 'simple_identifier') {
         return [{ name: getNodeText(inner, source), node: inner }];
       }
+      // Swift dotted form: rightmost simple_identifier; ObjC keeps selector text.
       const last = lastNamedOfType(node, new Set(['simple_identifier']));
       if (last) return [{ name: getNodeText(last, source), node: last }];
       return [{ name: getNodeText(inner, source).trim(), node: inner }];
@@ -744,23 +749,13 @@ function normalizeSpecial(
       return [];
     }
 
-    // `self.handle_click` (Python) — object EXACTLY `self`/`cls` keeps the
-    // bare attribute name (same-file method gate). Any other receiver
-    // (`self.store.fetch`, `FileService.parse`) is #1820: last identifier
-    // as `*.name`, skipGate so a unique cross-file method can resolve.
+    // Keep the receiver on Python member values; calls/subscripts are not
+    // statically named receivers and must not collapse to a bare method.
     case 'attribute': {
-      const obj = getChildByField(node, 'object');
       const attr = getChildByField(node, 'attribute');
-      if (!obj || !attr) return [];
-      const name = getNodeText(attr, source);
-      if (!name) return [];
-      if (
-        obj.type === 'identifier' &&
-        (getNodeText(obj, source) === 'self' || getNodeText(obj, source) === 'cls')
-      ) {
-        return [{ name, node: attr }];
-      }
-      return [{ name: `*.${name}`, node: attr, skipGate: true }];
+      const name = getNodeText(node, source);
+      return attr && /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(name)
+        ? [{ name, node: attr, skipGate: true }] : [];
     }
 
     // `this.Run0` (C#) — receiver must be EXACTLY `this`. Two grammar shapes:
