@@ -1046,5 +1046,37 @@ re-applied onto `main` rather than merged as written:
   agent singled out. Order: protected (when a hold-back applies), exact, spine, importance.
 - **Exact pricing sees member windows.** `renderedSizeOfKept` prices the spans `buildSection`
   renders (`sectionRangesOf`), so an oversize spine member costs its window.
+- **The final fit shortens the file header before it cuts source.** Every file is funded for
+  source against an *estimated* header (`sectionOverhead`, the file's own symbol names). The
+  real header also lists edge-line targets (`filter(calls)`) and can run past the estimate.
+  Once #2063 gave exact targets the spine's cap, a named file with qualified targets spent right
+  up to its funded line, and the saturated valve fixture's lower file lost 109 chars of source
+  to its own header (922 of 1,031; 995 on `main`). Where a section no longer fits, the header now
+  lists fewer names until it is back within its estimate, and only then is source cut. The
+  valve test asserts funding in full and delivery to the line: #2062's exact rendering stops at
+  the last whole line that fits, so a lower file may come in under its reservation by less than
+  one line.
 
-LANDING_MEASURED
+Measured on the same 47-query replay, `main` `7506dbff` vs this re-application, one index:
+
+| | `main` | `main` + named concentration |
+|---|---|---|
+| named bodies complete | 230 | **272** (13 responses up, 1 down) |
+| named lines delivered | 7,986 | **10,282** (+29%) |
+| responses over the 25K inline cap | 2 | **0** |
+| byte-identical responses | — | 16 of 47 |
+
+The one response down is okhttp's pinned `RealCall.kt`, which drops the mock server's
+`QueueDispatcher.kt`, holding an `enqueue` namesake, as the named file spends its reservation.
+The named definitions that lose lines all sit in responses that gain more: vscode's
+`MessageBuffer` class (187 → 65, with three more named bodies complete and +258 named lines),
+alamofire's `Session.request` (17 → 12, +48), and one swap: vscode's stress query renders
+`_doActivateExtension` whole (0 → 33) where `main` rendered `_startExtensionHost` (19 → 0), four
+complete bodies either way. Files also fall where the record above says they do (okhttp's
+`RealInterceptorChain.kt` pin, 6 → 4).
+
+A second replay: 17 queries that pin a real file past the 300-node pin cap and name symbols beyond
+it (vscode's `editorOptions.ts`, `chatService.ts`, `languages.ts`, `extHostTypes.ts`,
+`extHost.protocol.ts`; excalidraw's `App.tsx`; okhttp's `URLConnectionTest.kt`), most with an
+unpinned twin: 48 → 49 complete named bodies, 0 responses down, 753 → 760 named lines, and 3 → 0
+over the 25K cap (the summary-line reserve).
