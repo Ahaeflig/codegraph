@@ -115,6 +115,8 @@ export interface ResolutionContext {
   fileExists(filePath: string): boolean;
   /** Read file content */
   readFile(filePath: string): string | null;
+  /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
+  fileContains?(filePath: string, needle: string): boolean;
   /**
    * `readFile(filePath)` split into lines, LRU-cached per file. Receiver-type
    * inference scans source lines for EVERY `receiver.method()` ref; splitting

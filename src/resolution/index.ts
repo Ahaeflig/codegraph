@@ -467,6 +467,23 @@ export class ReferenceResolver {
   }
 
   /**
+   * `readFileCached(filePath)?.includes(needle)` for an ASCII needle, searched
+   * in the raw bytes: an ASCII byte sequence survives UTF-8 decoding
+   * unchanged, and decoding is most of reading a file nobody keeps.
+   */
+  private fileContains(filePath: string, needle: string): boolean {
+    if (this.fileCache.has(filePath)) return this.fileCache.get(filePath)?.includes(needle) ?? false;
+    const fullPath = path.join(this.projectRoot, filePath);
+    try {
+      const stats = fs.statSync(fullPath);
+      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) return false;
+      return fs.readFileSync(fullPath).includes(needle);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Create the resolution context
    */
   private createContext(): ResolutionContext {
@@ -624,6 +641,8 @@ export class ReferenceResolver {
       },
 
       readFile: (filePath: string) => this.readFileCached(filePath),
+
+      fileContains: (filePath: string, needle: string) => this.fileContains(filePath, needle),
 
       getFileLines: (filePath: string) => {
         const cached = this.fileLinesCache.get(filePath);
@@ -2637,6 +2656,34 @@ export class ReferenceResolver {
     // periodically so the #850 liveness watchdog heartbeat can fire (#1091).
     const maybeYield = createYielder();
     const resolved: ResolvedRef[] = [];
+    // Refs share supertypes (every `this.dispose` walks the same chain), and
+    // nothing is written until the loop ends: read each type's supertype
+    // edges, and each supertype's callable members by name, once.
+    const supertypeEdges = new Map<string, Edge[]>();
+    const callableMembers = new Map<string, Map<string, Node[]>>();
+    const supertypesOf = (id: string): Edge[] => {
+      let edges = supertypeEdges.get(id);
+      if (!edges) {
+        edges = this.queries.getOutgoingEdges(id, ['implements', 'extends']);
+        supertypeEdges.set(id, edges);
+      }
+      return edges;
+    };
+    const callableMembersOf = (id: string): Map<string, Node[]> => {
+      let byName = callableMembers.get(id);
+      if (!byName) {
+        byName = new Map();
+        for (const c of this.queries.getOutgoingEdges(id, ['contains'])) {
+          const m = this.nodeById(c.target);
+          if (!m || (m.kind !== 'function' && m.kind !== 'method')) continue;
+          const list = byName.get(m.name);
+          if (list) list.push(m);
+          else byName.set(m.name, [m]);
+        }
+        callableMembers.set(id, byName);
+      }
+      return byName;
+    };
     for (const ref of deferred) {
       await maybeYield();
       const member = ref.referenceName.slice('this.'.length);
@@ -2684,24 +2731,16 @@ export class ReferenceResolver {
       for (let depth = 0; depth < 5 && frontierNodes.length > 0 && !target; depth++) {
         const next: Node[] = [];
         for (const typeNode of frontierNodes) {
-          for (const edge of this.queries.getOutgoingEdges(typeNode.id, ['implements', 'extends'])) {
+          for (const edge of supertypesOf(typeNode.id)) {
             const superNode = this.nodeById(edge.target);
             if (!superNode || seenNodes.has(superNode.id)) continue;
             seenNodes.add(superNode.id);
             if (!SUPERTYPE_BEARING_KINDS.has(superNode.kind)) continue;
             // Member lookup anchored on the supertype's contains edges.
-            for (const c of this.queries.getOutgoingEdges(superNode.id, ['contains'])) {
-              const m = this.nodeById(c.target);
-              if (
-                m &&
-                m.name === member &&
-                (m.kind === 'function' || m.kind === 'method') &&
-                sameLanguageFamily(m.language, ref.language)
-              ) {
-                target = m;
-                break;
-              }
-            }
+            target =
+              callableMembersOf(superNode.id)
+                .get(member)
+                ?.find((m) => sameLanguageFamily(m.language, ref.language)) ?? null;
             if (target) break;
             next.push(superNode);
           }

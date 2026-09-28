@@ -313,6 +313,11 @@ export class QueryBuilder {
   // (and therefore resolution's insertion-order disambiguation) is identical
   // to the one-row-per-run path.
   private batchStmts: Map<string, SqliteStatement> = new Map();
+  // Kind-filtered edge reads build their SQL per call (a variable IN list),
+  // but from a handful of kind sets: prepare each shape once. Supertype walks
+  // and the member-lookup passes issue them per node, and preparing cost
+  // about a third of the read.
+  private edgeKindStmts: Map<string, SqliteStatement> = new Map();
   private static readonly BATCH_SIZES: readonly number[] = [128, 32, 8, 1];
 
   /**
@@ -372,6 +377,17 @@ export class QueryBuilder {
     this.db = db;
     this.stmts = {};
     this.batchStmts.clear();
+    this.edgeKindStmts.clear();
+  }
+
+  private edgeKindStmt(sql: string): SqliteStatement {
+    let stmt = this.edgeKindStmts.get(sql);
+    if (!stmt) {
+      if (this.edgeKindStmts.size >= 64) this.edgeKindStmts.delete(this.edgeKindStmts.keys().next().value!);
+      stmt = this.db.prepare(sql);
+      this.edgeKindStmts.set(sql, stmt);
+    }
+    return stmt;
   }
 
   /** Set the normalized project-name tokens used to down-weight non-discriminative
@@ -2045,7 +2061,7 @@ export class QueryBuilder {
       }
 
       sql += ' ORDER BY kind, target, line, col';
-      const rows = this.db.prepare(sql).all(...params) as EdgeRow[];
+      const rows = this.edgeKindStmt(sql).all(...params) as EdgeRow[];
       return rows.map(rowToEdge);
     }
 
@@ -2065,7 +2081,7 @@ export class QueryBuilder {
   getIncomingEdges(targetId: string, kinds?: EdgeKind[]): Edge[] {
     if (kinds && kinds.length > 0) {
       const sql = `SELECT * FROM edges WHERE target = ? AND kind IN (${kinds.map(() => '?').join(',')}) ORDER BY kind, source, line, col`;
-      const rows = this.db.prepare(sql).all(targetId, ...kinds) as EdgeRow[];
+      const rows = this.edgeKindStmt(sql).all(targetId, ...kinds) as EdgeRow[];
       return rows.map(rowToEdge);
     }
 
