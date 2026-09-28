@@ -49,7 +49,7 @@ describe('daemon ownership refresh under Windows sharing violations', () => {
     const error = denied('EPERM');
     vi.mocked(fs.renameSync).mockImplementation(() => { throw error; });
     expect(() => refreshDaemonLock(pidPath, initial, lock, 'win32')).toThrow(error);
-    expect(fs.renameSync).toHaveBeenCalledTimes(6);
+    expect(fs.renameSync).toHaveBeenCalledTimes(8);
     expect(fs.readFileSync(pidPath, 'utf8')).toBe(initial);
     noTemporaryFile();
   });
