@@ -279,6 +279,7 @@ export class QueryBuilder {
     getNodesByName?: SqliteStatement;
     getNodesByNamePrefix?: SqliteStatement;
     fileHasExportedNode?: SqliteStatement;
+    existingNodeIdsFull?: SqliteStatement;
     getExportedNodesByFile?: SqliteStatement;
     getNodesByFileAndName?: SqliteStatement;
     getFileNodesByNamePrefix?: SqliteStatement;
@@ -933,10 +934,17 @@ export class QueryBuilder {
     const uniqueIds = [...new Set(ids)];
     for (let i = 0; i < uniqueIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = uniqueIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db
-        .prepare(`SELECT id FROM nodes WHERE id IN (${placeholders})`)
-        .all(...chunk) as { id: string }[];
+      // Every edge insert checks its endpoints here, a chunk at a time: the
+      // full-size statement is prepared once, the final partial chunk ad hoc.
+      let stmt: SqliteStatement;
+      if (chunk.length === SQLITE_PARAM_CHUNK_SIZE) {
+        stmt = this.stmts.existingNodeIdsFull ??= this.db.prepare(
+          `SELECT id FROM nodes WHERE id IN (${new Array(SQLITE_PARAM_CHUNK_SIZE).fill('?').join(',')})`
+        );
+      } else {
+        stmt = this.db.prepare(`SELECT id FROM nodes WHERE id IN (${chunk.map(() => '?').join(',')})`);
+      }
+      const rows = stmt.all(...chunk) as { id: string }[];
       for (const row of rows) {
         out.add(row.id);
       }
