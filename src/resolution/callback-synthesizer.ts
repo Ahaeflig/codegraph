@@ -3725,7 +3725,10 @@ export async function synthesizeCallbackEdges(
   // WAL-valve writer backstop (WalCheckpointValve.backpressure), called at
   // pool-idle points in the edge-insert loops below — the passes themselves
   // only read; every write in this function happens with the pool idle.
-  backpressure?: () => Promise<void> | null
+  backpressure?: () => Promise<void> | null,
+  // Main-thread work to run while the pool computes the passes (the main
+  // thread otherwise only waits there) — e.g. building a deferred index.
+  whilePoolBusy?: () => void
 ): Promise<number> {
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
@@ -3856,8 +3859,23 @@ export async function synthesizeCallbackEdges(
   const MAIN_RETRY_MAX_NODES = 1_500_000;
   const graphNodes = queries.getNodeAndEdgeCount().nodes;
 
+  // Files whose text could feed a pass (inputs that produce NO edges included,
+  // e.g. an over-cap channel: deleting one may make the full pass viable). It
+  // depends only on the files, so with a pool the main thread reads them while
+  // the workers run the passes instead of after.
+  const collectInputs = async (): Promise<string[]> => {
+    const found: string[] = [];
+    for (const file of ctx.getAllFiles()) {
+      const content = ctx.readFile(file);
+      if (content !== null && hasSynthesisPattern(file, content)) found.push(file);
+      await yieldToLoop();
+    }
+    return found;
+  };
+  let inputs: string[] | null = null;
+
   if (pool && gatedIn.length > 1) {
-    await Promise.all(
+    const fanOut = Promise.all(
       gatedIn.map(async (i) => {
         const pass = SYNTH_PASSES[i]!;
         try {
@@ -3880,6 +3898,12 @@ export async function synthesizeCallbackEdges(
         }
       })
     );
+    // Observed now, awaited below: a rejection while the scan runs must not
+    // surface as an unhandled one.
+    fanOut.catch(() => undefined);
+    whilePoolBusy?.();
+    inputs = await collectInputs();
+    await fanOut;
   } else {
     for (const i of gatedIn) {
       await runPassOnMain(i);
@@ -3903,15 +3927,7 @@ export async function synthesizeCallbackEdges(
     await yieldToLoop();
     await foldIfOver();
   }
-  // Remember source gates, including inputs that currently produce NO edges
-  // (e.g. an over-cap channel). Deleting one may make the full pass viable.
-  const inputs: string[] = [];
-  for (const file of ctx.getAllFiles()) {
-    const content = ctx.readFile(file);
-    if (content !== null && hasSynthesisPattern(file, content)) inputs.push(file);
-    await yieldToLoop();
-  }
-  queries.replaceSynthesisInputs(inputs);
+  queries.replaceSynthesisInputs(inputs ?? await collectInputs());
   __mark('insertMergedEdges');
   return merged.length + goImpl.length + goMethodContains.length;
 }

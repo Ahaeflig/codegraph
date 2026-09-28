@@ -1693,7 +1693,12 @@ export class ReferenceResolver {
     // a 22GB WAL on a 4.6GB DB (migration plan §7a.1).
     parallel?: {
       dbPath: string;
-      bulkEdgeLoad?: { begin: () => void; end: () => void | Promise<void> };
+      bulkEdgeLoad?: {
+        begin: () => void;
+        end: () => void | Promise<void>;
+        /** Indexes `end` leaves for later; built while the pool runs synthesis. */
+        deferred?: () => void;
+      };
       /** unresolved_refs index window for the batched loop — the loop only
        *  reads the status index + PK; dropping the sync-path ref indexes cuts
        *  each per-batch DELETE's B-tree work (DatabaseConnection.beginBulkRefLoad). */
@@ -2113,6 +2118,19 @@ export class ReferenceResolver {
       }
     }
 
+    // Indexes the bulk-edge window's end deferred: built once, while the pool
+    // is busy with synthesis when it is, and in any case before this returns.
+    let deferredBuilt = !bulkEdgesActive || !parallel?.bulkEdgeLoad?.deferred;
+    const buildDeferredIndexes = (): void => {
+      if (deferredBuilt) return;
+      deferredBuilt = true;
+      const tDeferred = Date.now();
+      try {
+        parallel!.bulkEdgeLoad!.deferred!();
+      } catch { /* healed by schema.sql on the next open, like a crash in the window */ }
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] deferred-edge-index: ${Date.now() - tDeferred}ms`);
+    };
+
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
     // synthesize observer/callback dispatch edges (dispatcher → registered
     // callbacks) that static parsing leaves out. Best-effort — never fail the
@@ -2127,11 +2145,13 @@ export class ReferenceResolver {
         this.context,
         onSynthesisProgress,
         pool,
-        parallel?.backpressure
+        parallel?.backpressure,
+        buildDeferredIndexes
       );
     } catch {
       // synthesis is additive and optional; ignore failures
     }
+    buildDeferredIndexes();
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] callback-synthesis: ${Date.now() - tSynth}ms`);
     } finally {
       if (pool) await pool.destroy().catch(() => undefined);
