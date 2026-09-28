@@ -1144,6 +1144,133 @@ function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
  * and that another explore — not a Read — is how to reach it.
  */
 const EPILOGUE_LOST_NOTE = '> (Trailing pointer list omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
+/**
+ * The same note when a section above was trimmed (see `elidedWantedSpans`):
+ * it drops "complete", which would be false, and keeps the guarantee that is
+ * still true. The epilogue floor is reserved before the render knows which of
+ * the two it will need, so it reserves the longer; keeping this one no longer
+ * than {@link EPILOGUE_LOST_NOTE} leaves the floor where it was.
+ */
+const EPILOGUE_LOST_NOTE_TRIMMED = '> (Trailing pointer list omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)';
+
+/**
+ * One symbol a file section set out to deliver: a cluster member, or a symbol
+ * of the per-symbol (focused/skeleton) view. Completeness is judged against
+ * these, not against the file — explore never promises whole files, only the
+ * symbols it selected for each one.
+ */
+export type ExploreWantedSpan = {
+  name: string;
+  kind: string;
+  start: number;
+  end: number;
+  importance: number;
+  spine: boolean;
+};
+
+/**
+ * The wanted spans a section did NOT deliver in full: some line of the span is
+ * in neither what this call sent nor what an earlier call already sent (a
+ * back-referenced span counts — the agent holds that copy).
+ *
+ * Derived from the emitted ranges rather than from a flag each trim site has to
+ * remember to set. The oversize-spine window never set one, which is how a
+ * 62-line slice of vscode's 968-line `rpcProtocol.ts` went out under "Complete
+ * source … do NOT re-read them". Whatever elides source — a member shrink, a
+ * ceiling window, a dropped cluster, the per-symbol view, a path added later —
+ * shows up here.
+ *
+ * Most relevant first (spine, then importance), then source order.
+ */
+export function elidedWantedSpans(
+  wanted: ReadonlyArray<ExploreWantedSpan>,
+  delivered: ReadonlyArray<ExploreLineRange>,
+): ExploreWantedSpan[] {
+  const merged = mergeRanges(delivered);
+  const out = wanted.filter((w) => w.start > 0 && w.end >= w.start
+    && !merged.some((r) => r.start <= w.start && w.end <= r.end));
+  return out.sort((a, b) =>
+    Number(b.spine) - Number(a.spine) || b.importance - a.importance || a.start - b.start);
+}
+
+/** A rendered file whose section is missing some of what it set out to deliver. */
+export type ExplorePartialFile = { filePath: string; elided: ReadonlyArray<ExploreWantedSpan> };
+
+/** Trimmed files the completeness note names one by one; the rest are a count. */
+const TRIMMED_FILES_NAMED = 3;
+/** Elided symbols the completeness note names, from the spine or named by the agent. */
+const TRIMMED_SYMBOLS_NAMED = 4;
+/**
+ * Kinds the note never offers as a follow-up target. A container elided by a
+ * trim is too big for one section by construction, so exploring it by name
+ * comes back trimmed too; its members are the useful names.
+ */
+const TRIMMED_NAME_SKIP_KINDS = new Set([
+  'file', 'module', 'namespace', 'class', 'struct', 'union', 'interface', 'protocol', 'trait',
+]);
+
+/**
+ * The shortest trailing slice of each path that no other path in `paths`
+ * ends with: `extHostExtensionService.ts` alone when it is the only one,
+ * `node/extHostExtensionService.ts` beside `common/extHostExtensionService.ts`.
+ */
+export function shortestUniqueSuffixes(paths: ReadonlyArray<string>): Map<string, string> {
+  const all = [...new Set(paths)];
+  const out = new Map<string, string>();
+  for (const p of all) {
+    const segs = p.split('/');
+    let n = 1;
+    for (; n < segs.length; n++) {
+      const suffix = segs.slice(-n).join('/');
+      if (!all.some((o) => o !== p && (o === suffix || o.endsWith(`/${suffix}`)))) break;
+    }
+    out.set(p, segs.slice(-n).join('/'));
+  }
+  return out;
+}
+
+/**
+ * The large tiers' completeness note (`includeCompletenessSignal`), as
+ * candidates from most to least specific. The epilogue fit keeps the first
+ * one that fits the room left (CG-26).
+ *
+ * "Complete" is claimed only when no section elided anything it set out to
+ * deliver. Otherwise the note keeps the guarantee that is still true (every
+ * block shown is verbatim; treat it as already Read), names the trimmed files
+ * and the most relevant elided symbols as room allows, and sends the agent to
+ * another codegraph_explore for them. It never offers Read: explore output must
+ * not tell the agent to Read (AGENTS.md).
+ */
+export function exploreCompletenessNotes(
+  filesIncluded: number,
+  trimmed: ReadonlyArray<ExplorePartialFile>,
+  renderedPaths: ReadonlyArray<string>,
+): string[] {
+  if (trimmed.length === 0) {
+    return [`> **Complete source for ${filesIncluded} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading.`];
+  }
+  const label = shortestUniqueSuffixes([...renderedPaths, ...trimmed.map((t) => t.filePath)]);
+  const shownFiles = trimmed.slice(0, TRIMMED_FILES_NAMED).map((t) => `\`${label.get(t.filePath)}\``);
+  const moreFiles = trimmed.length - shownFiles.length;
+  const files = shownFiles.join(', ') + (moreFiles > 0 ? ` +${moreFiles} more` : '');
+  const names: string[] = [];
+  for (const t of trimmed) {
+    for (const e of t.elided) {
+      if (names.length >= TRIMMED_SYMBOLS_NAMED) break;
+      if (!(e.spine || e.importance >= 9) || TRIMMED_NAME_SKIP_KINDS.has(e.kind)) continue;
+      if (!names.includes(e.name)) names.push(e.name);
+    }
+  }
+  const head = `> **Verbatim source for ${filesIncluded} files is included above — treat it as already Read.**`;
+  const what = 'gap markers and file headers name what was elided';
+  const tail = 'For those, or anything under "Not shown above", make ANOTHER codegraph_explore with those exact names instead of reading the files — it returns their source with line numbers.';
+  const withFiles = `${head} Trimmed for size: ${files}; ${what}`;
+  const candidates = names.length > 0
+    ? [`${withFiles} (e.g. ${names.map((n) => `\`${n}\``).join(', ')}). ${tail}`]
+    : [];
+  candidates.push(`${withFiles}. ${tail}`, `${head} Some sections were trimmed for size; ${what}. ${tail}`);
+  return candidates;
+}
 
 /**
  * Match response delimiters rather than ASCII "path characters": filenames
@@ -4951,7 +5078,8 @@ export class ToolHandler {
         ? ` No indexed file uniquely matches ${unresolvedPathSpans.map((sp) => `\`${sp}\``).join(', ')}.`.length
         : 0)
       + setAsideNote.length;
-    const epilogueFloor = EPILOGUE_LOST_NOTE.length + 2 + cliffPointerFloor + summaryReserve;
+    const epilogueFloor = Math.max(EPILOGUE_LOST_NOTE.length, EPILOGUE_LOST_NOTE_TRIMMED.length)
+      + 2 + cliffPointerFloor + summaryReserve;
     // Absolute stop for the render loop. Reservations already fit the envelope, so
     // this only catches their bounded overshoot (the whole-file grace, an oversize
     // first cluster) — and catches it HERE, where a file can be skipped cleanly and
@@ -4972,6 +5100,11 @@ export class ToolHandler {
     // (#1046) — it must reflect what we show, not the raw candidate gather.
     const renderedFilePaths: string[] = [];
     let anyFileTrimmed = false;
+    // Rendered files whose section is missing some of what it set out to
+    // deliver, by path — measured at emission from the ranges actually sent
+    // (`elidedWantedSpans`), not from the trim sites. Drives the completeness
+    // note: "complete" is claimed only for sections that are.
+    const trimmedFiles = new Map<string, ExploreWantedSpan[]>();
     // Files that changed on disk after their last index sync (#1474). Their
     // indexed line ranges are untrustworthy, so sliced renders (adaptive /
     // skeleton / clusters) are OFF for them: a small drifted file still ships
@@ -5335,10 +5468,20 @@ export class ToolHandler {
         overhead: number;
         mode: 'whole' | 'clusters' | 'focused' | 'skeleton';
         clipped: boolean;
+        /**
+         * The symbols this section set out to deliver. Any not covered by
+         * `ranges` + `covered` marks the file trimmed for the completeness note.
+         * Empty for a whole-file render: it has nothing left to elide.
+         */
+        wanted: ReadonlyArray<ExploreWantedSpan>;
         /** The undeduped render, kept for the no-new-source fallback. */
         fullBody: string;
         fullRanges: ExploreLineRange[];
       }): void => {
+        // Judged on the ranges BEFORE the fold below: a fold is dedup's
+        // presentation of a sub-MIN_DELTA_CHARS remainder, not a trim for size.
+        const elided = elidedWantedSpans(opts.wanted, [...opts.ranges, ...opts.covered]);
+        if (elided.length > 0) trimmedFiles.set(filePath, elided);
         // A remainder too small to be worth a fence is folded into the pointer
         // (see MIN_DELTA_CHARS). Its ranges are then NOT recorded — the record
         // must only ever claim source that was actually sent.
@@ -5818,6 +5961,16 @@ export class ToolHandler {
             mode: bodyIds.size + bodyWindows.size > 0 ? 'focused' : 'skeleton',
             // Always "clipped": the per-symbol view elides bodies by construction.
             clipped: true,
+            // Every symbol whose body this view could have shown, ranked the way
+            // the cluster path ranks its members.
+            wanted: syms.map((n) => ({
+              name: n.name,
+              kind: n.kind,
+              start: n.startLine,
+              end: n.endLine,
+              importance: entryNodeIds.has(n.id) ? 10 : flow.namedNodeIds.has(n.id) ? 9 : 1,
+              spine: flow.pathNodeIds.has(n.id),
+            })),
             fullBody: withTail(skel),
             fullRanges: skel.map((p) => p.range),
           });
@@ -5955,6 +6108,7 @@ export class ToolHandler {
             overhead: 200,
             mode: 'whole',
             clipped: false,
+            wanted: [],
             fullBody: fullSection,
             fullRanges: [wholeRange],
           });
@@ -6855,6 +7009,9 @@ export class ToolHandler {
         // Windowing an oversize member elides source too — reporting it as
         // unclipped would hide exactly the cut the diagnostic exists to show.
         clipped: chosenNow.size < clusters.length || anyClusterShrunk,
+        // Every member of every cluster, chosen or not: a dropped cluster, a
+        // shrunk one and a windowed spine all leave a member short.
+        wanted: ranges,
         fullBody: sectionText(fullClusterParts),
         fullRanges: fullClusterParts.map((p) => p.range),
       });
@@ -6968,15 +7125,24 @@ export class ToolHandler {
       pointerOmitted = Math.max(0, remainingFiles.length - pointerEntries.length);
     }
 
-    // Completeness signal so agents know they don't need to re-read these files.
-    // On small projects the budget gates this off — but if we actually had to
-    // trim or drop clusters, surface a brief note so the agent knows it can
-    // still Read for more detail.
-    const completenessBlock: string[] = budget.includeCompletenessSignal
-      ? ['', '---', `> **Complete source for ${filesIncluded} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.`]
-      : anyFileTrimmed
-        ? ['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]
+    // Completeness signal so agents know they don't need to re-read these files
+    // — claimed only for sections that ARE complete. A trimmed section is
+    // measured from what was sent (`trimmedFiles`), in render order. On small
+    // projects the budget gates the signal off, but a trim still gets a brief
+    // note pointing at the names the gap markers carry.
+    const trimmedShown: ExplorePartialFile[] = renderedFilePaths
+      .filter((fp) => trimmedFiles.has(fp))
+      .map((fp) => ({ filePath: fp, elided: trimmedFiles.get(fp)! }));
+    const completenessCandidates: string[][] = budget.includeCompletenessSignal
+      ? exploreCompletenessNotes(filesIncluded, trimmedShown, renderedFilePaths)
+        .map((note) => ['', '---', note])
+      : anyFileTrimmed || trimmedShown.length > 0
+        ? [['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]]
         : [];
+    /** A fallback note's wording, by whether any section it vouches for was trimmed. */
+    const sourceAboveIs = (text: string): 'complete and verbatim' | 'verbatim' =>
+      trimmedShown.some((t) => text.includes(`${FILE_SECTION_PREFIX}${t.filePath}\``))
+        ? 'verbatim' : 'complete and verbatim';
 
     // Advisory exploration-guidance note based on project size. Deliberately
     // phrased as guidance, NOT a quota: agents read "budget / remaining calls /
@@ -7011,9 +7177,19 @@ export class ToolHandler {
     let room = hardCeiling - (flow.text.length + lines.join('\n').length)
       - Math.max(0, summaryReserve - SUMMARY_SENTINEL.length);
 
-    const keepCompleteness = completenessBlock.length > 0
-      && roomFor(completenessBlock) <= room;
-    if (keepCompleteness) room -= roomFor(completenessBlock);
+    // The most specific candidate that fits. A complete-source note keeps the
+    // precedence it always had. A TRIMMED note yields the pointer list's header
+    // and first entry when that much could fit: the list names files this
+    // response does not show at all, while what a trimmed section elided is
+    // already named in its own gap markers and header. It then gets a second
+    // try at whatever the list leaves.
+    const pointerNeed = pointerEntries.length > 0
+      ? roomFor([POINTER_HEADER, '', pointerEntries[0]!,
+        `- ... and ${pointerEntries.length - 1 + pointerOmitted} more files`])
+      : 0;
+    const pointerMin = trimmedShown.length > 0 && pointerNeed <= room ? pointerNeed : 0;
+    let completenessBlock = completenessCandidates.find((b) => roomFor(b) + pointerMin <= room) ?? [];
+    room -= roomFor(completenessBlock);
 
     const pointerBlock: string[] = [];
     if (pointerEntries.length > 0) {
@@ -7038,6 +7214,11 @@ export class ToolHandler {
         }
       }
     }
+    if (completenessBlock.length === 0) {
+      completenessBlock = completenessCandidates.find((b) => roomFor(b) <= room) ?? [];
+      room -= roomFor(completenessBlock);
+    }
+    const keepCompleteness = completenessBlock.length > 0;
     // Nothing of the pointer list survived, but there WAS one — say so, in the
     // one line that carries its instruction forward.
     const pointersLost = pointerEntries.length > 0 && pointerBlock.length === 0;
@@ -7048,8 +7229,10 @@ export class ToolHandler {
     lines.push(...pointerBlock);
     if (keepCompleteness) lines.push(...completenessBlock);
     if (keepBudgetNote) lines.push(...budgetBlock);
-    if (pointersLost && roomFor([EPILOGUE_LOST_NOTE, '']) <= room) {
-      lines.push('', EPILOGUE_LOST_NOTE);
+    const lostNote = sourceAboveIs(lines.join('\n')) === 'verbatim'
+      ? EPILOGUE_LOST_NOTE_TRIMMED : EPILOGUE_LOST_NOTE;
+    if (pointersLost && roomFor([lostNote, '']) <= room) {
+      lines.push('', lostNote);
     }
 
     const output = flow.text + lines.join('\n');
@@ -7063,7 +7246,9 @@ export class ToolHandler {
     const epilogueOnlyCut = epilogueStart < lines.length
       ? flow.text + lines.slice(0, epilogueStart).join('\n')
       : null;
-    const EPILOGUE_CUT_NOTE = '\n\n> (Trailing notes omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
+    const EPILOGUE_CUT_NOTE = epilogueOnlyCut !== null && sourceAboveIs(epilogueOnlyCut) === 'verbatim'
+      ? '\n\n> (Trailing notes omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)'
+      : '\n\n> (Trailing notes omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
 
     if (output.length > hardCeiling
         && epilogueOnlyCut !== null
@@ -7080,7 +7265,9 @@ export class ToolHandler {
       const lastSection = cut.lastIndexOf('\n' + FILE_SECTION_PREFIX);
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
-      finalText = safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)';
+      finalText = safe + (sourceAboveIs(safe) === 'verbatim'
+        ? '\n\n... (output truncated to budget; the source above is verbatim — treat it as already Read. For names its gap markers list, or any area not covered, run another codegraph_explore — do NOT Read these files.)'
+        : '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
     } else {
       finalText = output;
     }
