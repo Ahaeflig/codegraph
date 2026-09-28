@@ -242,6 +242,12 @@ export class ReferenceResolver {
   private lowerNameCache: LRUCache<string, Node[]>; // lower(name) → nodes cache
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
   private fileLinesCache: LRUCache<string, string[] | null>; // file → split lines cache
+  // id → node for the resolver's own point reads. Every resolved reference
+  // re-reads its target a few times (kind gate, language gate, alias
+  // following, edge creation) and targets recur ~5× on large repos; the query
+  // layer's cache is too small for that working set. Same stable window as the
+  // name caches above; absent ids are not cached.
+  private nodeByIdCache: LRUCache<string, Node>;
   private methodMatchCache: LRUCache<string, Node[]>; // lang\0Type::method → matching method nodes
   // Per-(language, methodName) owner index for getMethodMatches: buckets a
   // method name's candidates by their qualifiedName's last two segments so a
@@ -278,6 +284,8 @@ export class ReferenceResolver {
   // resolution pass (same lifetime assumption as nameCache); clearCaches() resets
   // it between passes. Callers must treat the returned array as read-only.
   private nodesByKindCache = new Map<Node['kind'], Node[]>();
+  // Filesystem existence probes behind context.fileExists (paths not in knownFiles).
+  private fileExistsMemo = new Map<string, boolean>();
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -308,6 +316,7 @@ export class ReferenceResolver {
     // Split-lines arrays are heavier than content strings; refs arrive
     // file-ordered, so a small cache still hits nearly always.
     this.fileLinesCache = new LRUCache(contentLimit);
+    this.nodeByIdCache = new LRUCache(Math.max(limit * 4, 20_000));
     this.methodMatchCache = new LRUCache(limit);
 
     this.context = this.createContext();
@@ -392,6 +401,15 @@ export class ReferenceResolver {
     this.cachesWarmed = true;
   }
 
+  /** `queries.getNodeById` through the resolver's own id → node cache. */
+  private nodeById(id: string): Node | null {
+    const cached = this.nodeByIdCache.get(id);
+    if (cached !== undefined) return cached;
+    const node = this.queries.getNodeById(id);
+    if (node) this.nodeByIdCache.set(id, node);
+    return node;
+  }
+
   /**
    * Clear internal caches
    */
@@ -404,11 +422,13 @@ export class ReferenceResolver {
     this.lowerNameCache.clear();
     this.qualifiedNameCache.clear();
     this.fileLinesCache.clear();
+    this.nodeByIdCache.clear();
     this.methodMatchCache.clear();
     this.methodOwnerIndexCache.clear();
     this.supertypeMemo.clear();
     this.supertypeGen++;
     this.nodesByKindCache.clear();
+    this.fileExistsMemo.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
@@ -568,14 +588,24 @@ export class ReferenceResolver {
         // calls per probe (~70x slower here). It would also be wrong to apply
         // — indexing deliberately follows in-root symlinks whose targets live
         // outside the root (#935), so only the `../` escape is refused.
+        // Memoized: import resolution probes the same candidate paths (every
+        // extension of a specifier) from every file that imports it, and the
+        // tree does not change within a resolution pass (same window as the
+        // file-content cache; dropped by clearCaches).
+        const probed = this.fileExistsMemo.get(filePath);
+        if (probed !== undefined) return probed;
         const fullPath = lexicalPathWithinRoot(this.projectRoot, filePath);
-        if (fullPath === null) return false;
-        try {
-          return fs.existsSync(fullPath);
-        } catch (error) {
-          logDebug('Error checking file existence', { filePath, error: String(error) });
-          return false;
+        let exists = false;
+        if (fullPath !== null) {
+          try {
+            exists = fs.existsSync(fullPath);
+          } catch (error) {
+            logDebug('Error checking file existence', { filePath, error: String(error) });
+          }
         }
+        if (this.fileExistsMemo.size >= 200_000) this.fileExistsMemo.clear();
+        this.fileExistsMemo.set(filePath, exists);
+        return exists;
       },
 
       readFile: (filePath: string) => this.readFileCached(filePath),
@@ -622,7 +652,7 @@ export class ReferenceResolver {
       },
 
       getNodeById: (id: string) => {
-        return this.queries.getNodeById(id);
+        return this.nodeById(id);
       },
 
       getSupertypes: (typeName: string, language) => {
@@ -649,7 +679,7 @@ export class ReferenceResolver {
           const supertypes = new Set<string>();
           for (const tn of typeNodes) {
             for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
-              const target = this.queries.getNodeById(edge.target);
+              const target = this.nodeById(edge.target);
               if (target?.name && target.name !== typeName) supertypes.add(target.name);
             }
           }
@@ -903,7 +933,7 @@ export class ReferenceResolver {
       : this.gateLanguage(candidate, ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
-    const target = this.queries.getNodeById(resolved.targetNodeId);
+    const target = this.nodeById(resolved.targetNodeId);
     if (!target) return resolved;
 
     const dot = ref.referenceName.lastIndexOf('.');
@@ -990,7 +1020,7 @@ export class ReferenceResolver {
       }
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       if (viaImport) {
-        const target = this.queries.getNodeById(viaImport.targetNodeId);
+        const target = this.nodeById(viaImport.targetNodeId);
         if (
           target &&
           (target.kind === 'function' ||
@@ -1104,7 +1134,7 @@ export class ReferenceResolver {
     // matcher would link each `mkOption` call to whichever file's inherit
     // binding it happened to pick. Same-file matches only.
     if (nameResult) {
-      const target = this.queries.getNodeById(nameResult.targetNodeId);
+      const target = this.nodeById(nameResult.targetNodeId);
       // A definition its language makes file-local — a C `static`, a Kotlin
       // `private fun`, a Go unexported name in another package, a Rust
       // non-`pub` item outside its module subtree — cannot be what a name in
@@ -1172,9 +1202,9 @@ export class ReferenceResolver {
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
-        const targetNode = this.queries.getNodeById(ref.targetNodeId);
+        const targetNode = this.nodeById(ref.targetNodeId);
         if (targetNode && (targetNode.kind === 'interface' || targetNode.kind === 'protocol')) {
-          const sourceNode = this.queries.getNodeById(ref.original.fromNodeId);
+          const sourceNode = this.nodeById(ref.original.fromNodeId);
           if (sourceNode && sourceNode.kind !== 'interface' && sourceNode.kind !== 'protocol') {
             kind = 'implements';
           }
@@ -1187,7 +1217,7 @@ export class ReferenceResolver {
       // apart from a function call without symbol info, but resolution
       // can: if `Foo` resolves to a class, the call IS an instantiation.
       if (kind === 'calls') {
-        const targetNode = this.queries.getNodeById(ref.targetNodeId);
+        const targetNode = this.nodeById(ref.targetNodeId);
         if (
           targetNode &&
           (targetNode.kind === 'class' || targetNode.kind === 'struct' || targetNode.kind === 'union')
@@ -2369,7 +2399,7 @@ export class ReferenceResolver {
    * Get file path from node ID
    */
   private getFilePathFromNodeId(nodeId: string): string {
-    const node = this.queries.getNodeById(nodeId);
+    const node = this.nodeById(nodeId);
     return node?.filePath || '';
   }
 
@@ -2377,7 +2407,7 @@ export class ReferenceResolver {
    * Get language from node ID
    */
   private getLanguageFromNodeId(nodeId: string): UnresolvedRef['language'] {
-    const node = this.queries.getNodeById(nodeId);
+    const node = this.nodeById(nodeId);
     return node?.language || 'unknown';
   }
 
@@ -2535,7 +2565,7 @@ export class ReferenceResolver {
   private resolveThisMemberFnRef(ref: UnresolvedRef): ResolvedRef | null {
     const member = ref.referenceName.slice('this.'.length);
     if (!member) return null;
-    const fromNode = this.queries.getNodeById(ref.fromNodeId);
+    const fromNode = this.nodeById(ref.fromNodeId);
     if (!fromNode) return null;
     // A hook declared at class-body level (Ruby `before_action :authenticate`)
     // attributes to the CLASS node itself — its qualified name IS the scope.
@@ -2595,7 +2625,7 @@ export class ReferenceResolver {
     for (const ref of deferred) {
       await maybeYield();
       const member = ref.referenceName.slice('this.'.length);
-      const fromNode = this.queries.getNodeById(ref.fromNodeId);
+      const fromNode = this.nodeById(ref.fromNodeId);
       if (!fromNode || !member) continue;
       // Class-body-level hooks (Ruby) attribute to the CLASS node itself.
       let className: string;
@@ -2640,13 +2670,13 @@ export class ReferenceResolver {
         const next: Node[] = [];
         for (const typeNode of frontierNodes) {
           for (const edge of this.queries.getOutgoingEdges(typeNode.id, ['implements', 'extends'])) {
-            const superNode = this.queries.getNodeById(edge.target);
+            const superNode = this.nodeById(edge.target);
             if (!superNode || seenNodes.has(superNode.id)) continue;
             seenNodes.add(superNode.id);
             if (!SUPERTYPE_BEARING_KINDS.has(superNode.kind)) continue;
             // Member lookup anchored on the supertype's contains edges.
             for (const c of this.queries.getOutgoingEdges(superNode.id, ['contains'])) {
-              const m = this.queries.getNodeById(c.target);
+              const m = this.nodeById(c.target);
               if (
                 m &&
                 m.name === member &&
@@ -2714,19 +2744,19 @@ export class ReferenceResolver {
     // A `#define` is a value, never a callee (#1838): a macro defined only in
     // an unrelated file is not what `NAME(x)` here expands to either.
     if (ref.referenceKind === 'calls') {
-      const target = this.queries.getNodeById(result.targetNodeId);
+      const target = this.nodeById(result.targetNodeId);
       if (target?.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(target.signature ?? '')) return null;
     }
 
     // An `imports` reference names something importable — never a member that
     // only exists inside a type.
     if (ref.referenceKind === 'imports') {
-      const target = this.queries.getNodeById(result.targetNodeId);
+      const target = this.nodeById(result.targetNodeId);
       return target && !isImportableKind(target.kind) ? null : result;
     }
 
     if (!isInheritanceRef(ref)) return result;
-    const target = this.queries.getNodeById(result.targetNodeId);
+    const target = this.nodeById(result.targetNodeId);
     if (target && !isSupertypeTarget(target)) {
       const type = this.sameNamedTypeOfValue(target);
       if (!type) return null;

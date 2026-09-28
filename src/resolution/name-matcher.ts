@@ -211,6 +211,15 @@ function hasBridgeEvidence(candidate: Node, ref: UnresolvedRef, context: Resolut
   return false;
 }
 
+/**
+ * Per-context memo: node id → its language, for gateLanguageMatch. Matches
+ * land on ~5 refs per target on vscode, and each check otherwise fetched the
+ * whole node (a point read + row decode past the query layer's small cache)
+ * only to read one field. Nodes are fixed within a resolution pass; the memo
+ * drops with clearNameMatcherMemos.
+ */
+const TARGET_LANGUAGE = new WeakMap<ResolutionContext, Map<string, string>>();
+
 /** Reject the chosen result without shrinking a pool or trying a replacement. */
 export function gateLanguageMatch(
   result: ResolvedRef | null,
@@ -218,6 +227,29 @@ export function gateLanguageMatch(
   context: ResolutionContext
 ): ResolvedRef | null {
   if (!result) return result;
+  // No code family on the reference's side: no target can cross a boundary.
+  if (CODE_FAMILY[ref.language] === undefined) return result;
+  if (context.getNodeById) {
+    let languages = TARGET_LANGUAGE.get(context);
+    if (!languages) {
+      languages = new Map();
+      TARGET_LANGUAGE.set(context, languages);
+    }
+    let language = languages.get(result.targetNodeId);
+    if (language === undefined) {
+      const node = context.getNodeById(result.targetNodeId);
+      if (node) {
+        language = node.language as string;
+        if (languages.size >= 400_000) languages.clear();
+        languages.set(result.targetNodeId, language);
+      }
+    }
+    if (language !== undefined) {
+      if (!crossesCodeBoundary(ref.language, language)) return result;
+      const target = context.getNodeById(result.targetNodeId);
+      return target && !hasBridgeEvidence(target, ref, context) ? null : result;
+    }
+  }
   const target = context.getNodeById?.(result.targetNodeId) ??
     context.getNodesByName(ref.referenceName).find((n) => n.id === result.targetNodeId);
   if (target && crossesCodeBoundary(ref.language, target.language) &&
@@ -2097,6 +2129,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   GET_STATE_FILES.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
+  TARGET_LANGUAGE.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
