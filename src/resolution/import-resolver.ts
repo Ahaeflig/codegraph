@@ -154,6 +154,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   fileExportIndexes.delete(context);
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
+  pythonModuleFileMemos.delete(context);
 }
 
 export function resolveImportPath(
@@ -1977,23 +1978,48 @@ function resolveModuleImportToFile(
  * no edge. Shared by absolute `import a.b.c` and absolute `from a.b import c`
  * (where `c` is a submodule) resolution.
  */
+/**
+ * Per-context memo for findPythonModuleFile: module path → the `<mod>.py` and
+ * `<mod>/__init__.py` file nodes whose path ends with it, in name-lookup
+ * order. Only the importing file's own path is excluded per call, so taking
+ * the first survivor returns the node the unmemoized scan found. Without it,
+ * every ref naming a module outside the project (`from unittest import mock`)
+ * rescanned every `__init__.py` in the tree. Same stable window as the name
+ * caches; dropped by clearImportResolverMemos.
+ */
+const pythonModuleFileMemos = new WeakMap<ResolutionContext, Map<string, { module: Node[]; pkg: Node[] }>>();
+
 function findPythonModuleFile(
   mod: string,
   context: ResolutionContext,
   excludeFilePath: string
 ): Node | null {
   if (!mod || mod.startsWith('.')) return null; // relative imports handled elsewhere
-  const rel = mod.replace(/\./g, '/');
-  const lastSeg = mod.split('.').pop()!;
-  const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
-  const moduleFile = context
-    .getNodesByName(`${lastSeg}.py`)
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}.py`));
-  if (moduleFile) return moduleFile;
-  const pkgFile = context
-    .getNodesByName('__init__.py')
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}/__init__.py`));
-  return pkgFile ?? null;
+  let memo = pythonModuleFileMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    pythonModuleFileMemos.set(context, memo);
+  }
+  let files = memo.get(mod);
+  if (!files) {
+    const rel = mod.replace(/\./g, '/');
+    const lastSeg = mod.split('.').pop()!;
+    const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
+    files = {
+      module: context
+        .getNodesByName(`${lastSeg}.py`)
+        .filter((n) => n.kind === 'file' && endsWith(n.filePath, `${rel}.py`)),
+      pkg: context
+        .getNodesByName('__init__.py')
+        .filter((n) => n.kind === 'file' && endsWith(n.filePath, `${rel}/__init__.py`)),
+    };
+    memo.set(mod, files);
+  }
+  return (
+    files.module.find((n) => n.filePath !== excludeFilePath) ??
+    files.pkg.find((n) => n.filePath !== excludeFilePath) ??
+    null
+  );
 }
 
 /**
