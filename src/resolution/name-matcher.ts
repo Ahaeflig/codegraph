@@ -969,6 +969,77 @@ const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /**
+ * Where a file's local bindings can start, for isLocallyBoundJsName: every
+ * `const`/`let`/`var` and `function`/`class` keyword and every `=>`. Each
+ * binding pattern can only match from one of these (or, for a parameter,
+ * from the `(` before an occurrence of the name), so a lookup tries its
+ * patterns at those offsets instead of searching the file once per pattern
+ * per name. Kept for the last few files — calls arrive file by file.
+ */
+interface LocalBindingSites {
+  varDecls: number[];
+  fnDecls: number[];
+  arrows: number[];
+}
+const LOCAL_BINDING_SITES = new WeakMap<ResolutionContext, Map<string, LocalBindingSites>>();
+const LOCAL_BINDING_SITES_KEEP = 16;
+const VAR_DECL_SITE = /\b(?:const|let|var)\s/g;
+const FN_DECL_SITE = /\b(?:function|class)\s/g;
+
+function localBindingSites(filePath: string, source: string, context: ResolutionContext): LocalBindingSites {
+  let cache = LOCAL_BINDING_SITES.get(context);
+  if (!cache) {
+    cache = new Map();
+    LOCAL_BINDING_SITES.set(context, cache);
+  }
+  let sites = cache.get(filePath);
+  if (!sites) {
+    const offsets = (re: RegExp): number[] => Array.from(source.matchAll(re), (m) => m.index!);
+    const arrows: number[] = [];
+    for (let a = source.indexOf('=>'); a !== -1; a = source.indexOf('=>', a + 2)) arrows.push(a);
+    sites = { varDecls: offsets(VAR_DECL_SITE), fnDecls: offsets(FN_DECL_SITE), arrows };
+    if (cache.size >= LOCAL_BINDING_SITES_KEEP) cache.delete(cache.keys().next().value!);
+    cache.set(filePath, sites);
+  }
+  return sites;
+}
+
+type LocalBindingPatterns = { decl: RegExp; fn: RegExp; param: RegExp };
+/** Sticky binding patterns by name — the same names recur file after file. */
+const LOCAL_BINDING_PATTERNS = new Map<string, LocalBindingPatterns>();
+const LOCAL_BINDING_PATTERNS_CAP = 4096;
+const JS_BINDING_NAME = /^[\w$]+$/;
+const ARROW_HEAD_CHAR = /[\w$.]/;
+const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:require|import)\s*\(/;
+
+function localBindingPatterns(name: string, flags: string): LocalBindingPatterns {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return {
+    // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
+    // not a shadow: the symbol lives in the other file and the call means it.
+    decl: new RegExp(
+      '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+      flags
+    ),
+    fn: new RegExp('\\b(?:function|class)\\s+' + n + '\\b', flags),
+    // a parameter: every token before the name in the list is itself a
+    // parameter (identifier, optional type, optional default) — so a string
+    // argument containing the word cannot match.
+    // Each earlier parameter has exactly one parse: its first non-space
+    // character after the identifier picks the type (`?`/`:`), default (`=`)
+    // or bare alternative. Written as `(type)?(default)?\s*`, the same
+    // strings split several ways per parameter, and a failing search
+    // backtracked through every combination — 30-40s per name on a vscode
+    // test file whose helper takes nine `name: T = value` parameters.
+    param: new RegExp(
+      '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*(?:\\?\\s*)?:[^,()]+|\\s*=[^,()]+|\\s*),\\s*)*' +
+        n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)',
+      flags
+    ),
+  };
+}
+
+/**
  * Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
  * `function`/`class` declaration (destructuring included) or as a parameter
  * of a function or arrow. Such a binding shadows every same-named symbol in
@@ -991,37 +1062,71 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
   const source = context.readFile(filePath) ?? '';
-  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
-  // not a shadow: the symbol lives in the other file and the call means it.
-  const declRe = new RegExp(
-    '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
-    'g'
-  );
-  let bound = false;
-  for (const m of source.matchAll(declRe)) {
-    if (!/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(m[1] ?? '')) { bound = true; break; }
-  }
-  if (!bound) {
-    bound =
-      new RegExp('\\b(?:function|class)\\s+' + n + '\\b').test(source) ||
-      // a parameter: every token before the name in the list is itself a
-      // parameter (identifier, optional type, optional default) — so a string
-      // argument containing the word cannot match.
-      // Each earlier parameter has exactly one parse: its first non-space
-      // character after the identifier picks the type (`?`/`:`), default (`=`)
-      // or bare alternative. Written as `(type)?(default)?\s*`, the same
-      // strings split several ways per parameter, and a failing search
-      // backtracked through every combination — 30-40s per name on a vscode
-      // test file whose helper takes nine `name: T = value` parameters.
-      new RegExp(
-        '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*(?:\\?\\s*)?:[^,()]+|\\s*=[^,()]+|\\s*),\\s*)*' +
-          n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)'
-      ).test(source) ||
-      new RegExp('(?:^|[^\\w$.])' + n + '\\s*=>').test(source);
-  }
+  const bound = JS_BINDING_NAME.test(name)
+    ? bindsAtSites(source, name, localBindingSites(filePath, source, context))
+    : bindsAnywhere(source, name);
   memo.set(key, bound);
   return bound;
+}
+
+/** isLocallyBoundJsName's patterns, searched through the whole source. */
+function bindsAnywhere(source: string, name: string): boolean {
+  const { decl, fn, param } = localBindingPatterns(name, 'g');
+  for (const m of source.matchAll(decl)) {
+    if (!IMPORT_BINDING_VALUE.test(m[1] ?? '')) return true;
+  }
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return fn.test(source) || param.test(source) || new RegExp('(?:^|[^\\w$.])' + n + '\\s*=>').test(source);
+}
+
+/**
+ * bindsAnywhere for a plain identifier, tried only where a match can start:
+ * a declaration at its keyword (in order, resuming past each match exactly as
+ * the global search does), a parameter at the `(` its list opens with — the
+ * last `(` before an occurrence of the name, with no `)` between, since no
+ * earlier parameter can hold a parenthesis — and `name =>` at each arrow.
+ */
+function bindsAtSites(source: string, name: string, sites: LocalBindingSites): boolean {
+  let patterns = LOCAL_BINDING_PATTERNS.get(name);
+  if (!patterns) {
+    patterns = localBindingPatterns(name, 'y');
+    if (LOCAL_BINDING_PATTERNS.size >= LOCAL_BINDING_PATTERNS_CAP) {
+      LOCAL_BINDING_PATTERNS.delete(LOCAL_BINDING_PATTERNS.keys().next().value!);
+    }
+    LOCAL_BINDING_PATTERNS.set(name, patterns);
+  }
+  const { decl, fn, param } = patterns;
+  let from = 0;
+  for (const at of sites.varDecls) {
+    if (at < from) continue;
+    decl.lastIndex = at;
+    const m = decl.exec(source);
+    if (!m) continue;
+    from = at + m[0].length;
+    if (!IMPORT_BINDING_VALUE.test(m[1] ?? '')) return true;
+  }
+  for (const at of sites.fnDecls) {
+    fn.lastIndex = at;
+    if (fn.test(source)) return true;
+  }
+  let tried = -1;
+  for (let at = source.indexOf(name); at !== -1; at = source.indexOf(name, at + 1)) {
+    const open = at > 0 ? source.lastIndexOf('(', at - 1) : -1;
+    if (open < 0 || open === tried || source.lastIndexOf(')', at - 1) > open) continue;
+    tried = open;
+    param.lastIndex = open;
+    if (param.test(source)) return true;
+  }
+  // `name =>`: the name ends where the whitespace before the arrow starts.
+  for (const arrow of sites.arrows) {
+    let end = arrow;
+    while (end > 0 && WHITESPACE.test(source[end - 1]!)) end--;
+    const start = end - name.length;
+    if (start >= 0 && source.startsWith(name, start) && (start === 0 || !ARROW_HEAD_CHAR.test(source[start - 1]!))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -2147,6 +2252,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_TRAIT_IMPL_MEMO.delete(context);
   SEALED_MODULES.delete(context);
   LOCAL_BINDING_MEMO.delete(context);
+  LOCAL_BINDING_SITES.delete(context);
   SELECTOR_NAMES.delete(context);
   GET_STATE_FILES.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
@@ -3389,11 +3495,18 @@ function matchRustSelfFieldCall(
  * from file source: drops with clearNameMatcherMemos.
  */
 const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, { valueType: boolean; type: string } | null>>();
-/** The last few classes' comment-stripped lines — calls arrive file by file. */
-const TS_CLASS_LINES = new WeakMap<ResolutionContext, Map<string, string[] | null>>();
+/** A class's comment-stripped lines, and which of them hold each `[\w$#]` token. */
+interface TsClassDecl {
+  lines: string[];
+  /** Field lookups so far; the token index is built on the second. */
+  lookups: number;
+  linesByToken: Map<string, number[]> | null;
+}
+/** The last few classes' declarations — calls arrive file by file. */
+const TS_CLASS_LINES = new WeakMap<ResolutionContext, Map<string, TsClassDecl | null>>();
 const TS_CLASS_LINES_KEEP = 32;
 
-function tsClassDeclLines(cls: Node, context: ResolutionContext): string[] | null {
+function tsClassDecl(cls: Node, context: ResolutionContext): TsClassDecl | null {
   let cache = TS_CLASS_LINES.get(context);
   if (!cache) {
     cache = new Map();
@@ -3402,15 +3515,108 @@ function tsClassDeclLines(cls: Node, context: ResolutionContext): string[] | nul
   const hit = cache.get(cls.id);
   if (hit !== undefined) return hit;
   const source = context.readFile(cls.filePath);
-  const lines = source
-    ? source
-        .split('\n')
-        .slice(Math.max(0, cls.startLine - 1), cls.endLine)
-        .map((rawLine) => rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, ''))
+  const decl = source
+    ? {
+        lines: source
+          .split('\n')
+          .slice(Math.max(0, cls.startLine - 1), cls.endLine)
+          .map((rawLine) => rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '')),
+        lookups: 0,
+        linesByToken: null,
+      }
     : null;
   if (cache.size >= TS_CLASS_LINES_KEEP) cache.delete(cache.keys().next().value!);
-  cache.set(cls.id, lines);
-  return lines;
+  cache.set(cls.id, decl);
+  return decl;
+}
+
+const TS_FIELD_TOKEN = /^[\w$#]+$/;
+const TS_LINE_TOKEN = /[\w$#]+/g;
+const TS_TOKEN_CHAR = /[\w$#]/;
+
+/**
+ * tsFieldPatterns with the field spelled `[\w$#]+`, tried sticky at a whole-
+ * token occurrence of the field. There the run consumes exactly the field (a
+ * shorter prefix cannot continue: every pattern needs `\s`, `?`, `!`, `:` or
+ * `=` next), so each matches exactly where the field's own pattern would —
+ * without compiling three patterns for every field of every class.
+ */
+const TS_FIELD_PATTERNS_AT: readonly TsFieldPattern[] = [
+  { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)/y, valueType: true },
+  { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)/y, valueType: false },
+  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)/y, valueType: false },
+];
+
+/** The first declaration of `field` on one line, as `line.match` of its patterns in order would find it. */
+function tsFieldOnLine(line: string, field: string): { valueType: boolean; type: string } | null {
+  let at: number[] | null = null;
+  for (let i = line.indexOf(field); i !== -1; i = line.indexOf(field, i + 1)) {
+    const end = i + field.length;
+    if ((i > 0 && TS_TOKEN_CHAR.test(line[i - 1]!)) || (end < line.length && TS_TOKEN_CHAR.test(line[end]!))) continue;
+    (at ??= []).push(i);
+  }
+  if (!at) return null;
+  for (const { re, valueType } of TS_FIELD_PATTERNS_AT) {
+    for (const i of at) {
+      re.lastIndex = i;
+      const m = re.exec(line);
+      if (m && m[1]) return { valueType, type: m[1] };
+    }
+  }
+  return null;
+}
+
+/** Indices of the class lines holding `token` as a whole `[\w$#]` run, ascending. */
+function tsClassLinesWithToken(decl: TsClassDecl, token: string): readonly number[] {
+  if (!decl.linesByToken) {
+    const index = new Map<string, number[]>();
+    for (let i = 0; i < decl.lines.length; i++) {
+      for (const m of decl.lines[i]!.matchAll(TS_LINE_TOKEN)) {
+        const rows = index.get(m[0]);
+        if (!rows) index.set(m[0], [i]);
+        else if (rows[rows.length - 1] !== i) rows.push(i);
+      }
+    }
+    decl.linesByToken = index;
+  }
+  return decl.linesByToken.get(token) ?? [];
+}
+
+type TsFieldPattern = { re: RegExp; valueType: boolean };
+/** Compiled declaration patterns by field name — fields recur across classes. */
+const TS_FIELD_PATTERNS = new Map<string, TsFieldPattern[]>();
+const TS_FIELD_PATTERNS_CAP = 4096;
+
+function tsFieldPatterns(field: string): TsFieldPattern[] {
+  const hit = TS_FIELD_PATTERNS.get(field);
+  if (hit) return hit;
+  const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // A word boundary cannot open a private name; it also lets a public
+  // `items` match `#items`. Keep the two field namespaces distinct (#1987).
+  const fieldStart = '(?<![\\w$#])';
+  const patterns: TsFieldPattern[] = [
+    // `storage: typeof DraftHubStorage` — the type OF a value: an object
+    // literal used as a namespace. Its members are bare-named functions inside
+    // the constant's extent (#1573), so they are found by containment, not by
+    // `Type::method`. Tried first: the declared-type pattern below would
+    // otherwise capture the word `typeof`.
+    {
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
+      valueType: true,
+    },
+    // `private readonly mailer?: Mailer` — a class field or a constructor
+    // parameter property; the capture stops at `<`, `[` or `|`, so a generic
+    // or union type yields its head and resolveMethodOnType decides.
+    {
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
+      valueType: false,
+    },
+    // `mailer = new Mailer()` / `this.mailer = new Mailer()`
+    { re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
+  ];
+  if (TS_FIELD_PATTERNS.size >= TS_FIELD_PATTERNS_CAP) TS_FIELD_PATTERNS.delete(TS_FIELD_PATTERNS.keys().next().value!);
+  TS_FIELD_PATTERNS.set(field, patterns);
+  return patterns;
 }
 
 function tsFieldDeclaration(
@@ -3427,35 +3633,23 @@ function tsFieldDeclaration(
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
   let found: { valueType: boolean; type: string } | null = null;
-  const lines = tsClassDeclLines(cls, context);
-  if (lines) {
-    const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // A word boundary cannot open a private name; it also lets a public
-    // `items` match `#items`. Keep the two field namespaces distinct (#1987).
-    const fieldStart = '(?<![\\w$#])';
-    const patterns: Array<{ re: RegExp; valueType: boolean }> = [
-      // `storage: typeof DraftHubStorage` — the type OF a value: an object
-      // literal used as a namespace. Its members are bare-named functions inside
-      // the constant's extent (#1573), so they are found by containment, not by
-      // `Type::method`. Tried first: the declared-type pattern below would
-      // otherwise capture the word `typeof`.
-      {
-        re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
-        valueType: true,
-      },
-      // `private readonly mailer?: Mailer` — a class field or a constructor
-      // parameter property; the capture stops at `<`, `[` or `|`, so a generic
-      // or union type yields its head and resolveMethodOnType decides.
-      {
-        re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
-        valueType: false,
-      },
-      // `mailer = new Mailer()` / `this.mailer = new Mailer()`
-      { re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
-    ];
-    scan: for (const line of lines) {
+  const decl = tsClassDecl(cls, context);
+  if (decl && TS_FIELD_TOKEN.test(field)) {
+    // Every pattern needs the field as a whole `[\w$#]` run — the lookbehind
+    // bars one before it, and nothing after it but `\s`, `?`, `!`, `:` or `=`
+    // can continue a match — so only lines holding that token can match. A
+    // class asked about several fields is indexed by token once.
+    const rows = ++decl.lookups > 1 ? tsClassLinesWithToken(decl, field) : null;
+    const count = rows ? rows.length : decl.lines.length;
+    for (let k = 0; k < count && !found; k++) {
+      const line = decl.lines[rows ? rows[k]! : k]!;
       // Every pattern spells the field literally, so only a line that contains
       // it can match — and most of a class's lines never mention a given field.
+      if (line.includes(field)) found = tsFieldOnLine(line, field);
+    }
+  } else if (decl) {
+    const patterns = tsFieldPatterns(field);
+    scan: for (const line of decl.lines) {
       if (!line.includes(field)) continue;
       for (const { re, valueType } of patterns) {
         const m = line.match(re);

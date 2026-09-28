@@ -484,6 +484,16 @@ export class ReferenceResolver {
         return cached !== undefined ? cached.some((n) => n.isExported) : this.queries.fileHasExportedNode(filePath);
       },
 
+      getExportedNodesInFile: (filePath: string) => {
+        const cached = this.nodeCache.get(filePath);
+        return cached !== undefined ? cached.filter((n) => n.isExported) : this.queries.getExportedNodesByFile(filePath);
+      },
+
+      getNodesInFileNamed: (filePath: string, name: string) => {
+        const cached = this.nodeCache.get(filePath);
+        return cached !== undefined ? cached.filter((n) => n.name === name) : this.queries.getNodesByFileAndName(filePath, name);
+      },
+
       getNodesByName: (name: string) => {
         const cached = this.nameCache.get(name);
         if (cached !== undefined) return cached;
