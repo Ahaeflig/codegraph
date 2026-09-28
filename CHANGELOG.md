@@ -171,6 +171,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- On Windows, the shared MCP daemon now waits longer for another program — an antivirus scan, an indexer, or another session reading its lock file — to let go of that file, so it starts instead of leaving the session to fall back to a slower in-process server. (#1773)
 - File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
@@ -215,6 +216,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_explore` now finds a file when the query is its exact Chinese filename, with or without the extension. Thanks @Syh1906. (#1372)
 - `codegraph_explore` now returns the methods and types you name from a large file instead of a few lines around one call. When a file's symbols sat close together, and whenever you named the file by path, the answer could show only its first lines and a window on one call site, leave out the bodies you asked for, and still call the file complete, so your agent read it back. A genuinely long function on the call path is still shortened to its signature and the call that matters, and the answer now says when it did.
 - When your question names symbols concentrated in one file and the answer has room to spare, `codegraph_explore` now uses that room for the file you named instead of stopping at a fixed share of the response, so every body you asked for fits. Other files in the answer keep the space they were given.
+- `codegraph_explore` no longer tells your agent an answer's source is complete when part of it was shortened to fit. On larger projects it now names the files it trimmed and the functions it left out, so your agent asks for those by name instead of reading the file, and it no longer suggests reading a file as a fallback.
 - Java, Kotlin and Scala packages named `build` under a source root are indexed again, while real build-output directories stay excluded. Thanks @CmmVoid for the report and @danusha2345. (#1642)
 - Files over the 1 MB source limit, such as a package archive an import points at, are now rejected before they are read during resolution, removing a multi-gigabyte memory spike at startup. Thanks @hcg1023 for the report and @danusha2345. (#1553)
 - `codegraph sync` now reports that the index is busy and exits non-zero when another process holds the write lock, instead of printing "Already up to date". Thanks @inth3shadows. (#1361)
@@ -239,6 +241,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On Windows, simply reading a file no longer shows up as a pending edit: watcher events whose file still has the indexed size and modification time (NTFS access-time notifications) are ignored. Thanks @radeilic for the report and @JJordan0C. (#1451)
 - The Windows bundle now includes an extensionless `codegraph` launcher, so Git Bash — and the Claude Code prompt hook that runs through it — can find `codegraph` instead of failing with exit code 127. Thanks @Dj-Khalle. (#1278)
 - Running `install.sh` from Git Bash, MSYS or Cygwin on Windows now prints the PowerShell install command instead of failing with "unsupported OS". Thanks @Dnllns. (#1294)
+- Indexing no longer hangs at full CPU when a database write fails partway through; it now stops and reports the error. (#1773)
 
 #### Screens, links and navigation
 
