@@ -6,13 +6,15 @@
  * response used to end with "Complete source for N files is included above —
  * do NOT re-read them", whatever the render had cut. That is how a 62-line
  * slice of vscode's 968-line `rpcProtocol.ts` was presented as complete: the
- * oversize-spine window elided most of the file and never set the trim flag
- * the small tiers' note keys off. The same line also said "Reserve Read for a
- * single specific line range", and explore output must never tell the agent to
- * Read (AGENTS.md).
+ * oversize-spine window elided most of the file, and until #2068 it did not
+ * even set the trim flag the small tiers' note keys off. The same line also
+ * said "Reserve Read for a single specific line range", and explore output must
+ * never tell the agent to Read (AGENTS.md).
  *
  * The fixture reproduces that shape: a flow whose spine runs through one long
  * method, which the render windows to its head plus the next-hop call site.
+ * The large-tier test fails without the measured check; the small-tier one
+ * pins that the two tiers agree.
  */
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -289,7 +291,7 @@ describe('codegraph_explore — the note follows what the render cut', () => {
     expect(epilogueOf(text)).not.toMatch(OFFERS_READ);
   });
 
-  it('small tier: the same cut gets the trimmed note it used to miss', async () => {
+  it('small tier: the same cut gets the trimmed note', async () => {
     const text = await explore('runPipeline stepNext finalizeStep');
     expect(text).not.toContain('PIPELINE_TAIL_MARKER');
     expect(text).toContain('Some file sections were trimmed for size');

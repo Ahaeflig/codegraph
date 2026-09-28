@@ -1176,8 +1176,8 @@ export type ExploreWantedSpan = {
  * back-referenced span counts — the agent holds that copy).
  *
  * Derived from the emitted ranges rather than from a flag each trim site has to
- * remember to set. The oversize-spine window never set one, which is how a
- * 62-line slice of vscode's 968-line `rpcProtocol.ts` went out under "Complete
+ * remember to set. The oversize-spine window set none until #2068, which is how
+ * a 62-line slice of vscode's 968-line `rpcProtocol.ts` went out under "Complete
  * source … do NOT re-read them". Whatever elides source — a member shrink, a
  * ceiling window, a dropped cluster, the per-symbol view, a path added later —
  * shows up here.
