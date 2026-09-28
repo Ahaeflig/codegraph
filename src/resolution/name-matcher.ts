@@ -678,13 +678,19 @@ function isSealedModule(filePath: string, context: ResolutionContext): boolean {
   const hit = memo.get(filePath);
   if (hit !== undefined) return hit;
   const source = context.readFile(filePath);
-  const code = source === null ? '' : blankStringContents(stripCommentsForRegex(source, 'typescript'));
   // CommonJS assignments can execute inside template interpolations, which the
   // masker blanks. Keep the conservative raw-source exemption for those forms.
+  // Cheapest disqualifiers first: nearly every module exports a node, and
+  // masking the source is only needed to rule out the ones that don't. (The
+  // masker only blanks text, so no `import` in the source means none in code.)
   const sealed =
-    source !== null && HAS_IMPORT_STATEMENT.test(code) &&
+    source !== null && source.includes('import') &&
     !context.getNodesInFile(filePath).some((n) => n.isExported) &&
-    !HAS_ESM_EXPORT.test(code) && !HAS_CJS_EXPORT.test(source);
+    !HAS_CJS_EXPORT.test(source) &&
+    (() => {
+      const code = blankStringContents(stripCommentsForRegex(source, 'typescript'));
+      return HAS_IMPORT_STATEMENT.test(code) && !HAS_ESM_EXPORT.test(code);
+    })();
   memo.set(filePath, sealed);
   return sealed;
 }
