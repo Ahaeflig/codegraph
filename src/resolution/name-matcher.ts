@@ -2083,6 +2083,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   LOCAL_BINDING_MEMO.delete(context);
   SELECTOR_NAMES.delete(context);
   GET_STATE_FILES.delete(context);
+  TS_FIELD_DECL_MEMO.delete(context);
+  TS_CLASS_LINES.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -3314,6 +3316,96 @@ function matchRustSelfFieldCall(
 }
 
 /**
+ * Per-context memo for matchTsThisFieldCall's declaration scan: `classId\0field`
+ * → the first line of the class that declares the field (as `: typeof X`,
+ * `: X`, or `= new X`, tried in that order per line) with its captured type,
+ * or null. The scan depends only on the class and the field, but ran for every
+ * `this.<field>.<method>()` call — re-splitting the file and compiling three
+ * patterns each time, a third of all method-call matching on vscode. Derived
+ * from file source: drops with clearNameMatcherMemos.
+ */
+const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, { valueType: boolean; type: string } | null>>();
+/** The last few classes' comment-stripped lines — calls arrive file by file. */
+const TS_CLASS_LINES = new WeakMap<ResolutionContext, Map<string, string[] | null>>();
+const TS_CLASS_LINES_KEEP = 32;
+
+function tsClassDeclLines(cls: Node, context: ResolutionContext): string[] | null {
+  let cache = TS_CLASS_LINES.get(context);
+  if (!cache) {
+    cache = new Map();
+    TS_CLASS_LINES.set(context, cache);
+  }
+  const hit = cache.get(cls.id);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(cls.filePath);
+  const lines = source
+    ? source
+        .split('\n')
+        .slice(Math.max(0, cls.startLine - 1), cls.endLine)
+        .map((rawLine) => rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, ''))
+    : null;
+  if (cache.size >= TS_CLASS_LINES_KEEP) cache.delete(cache.keys().next().value!);
+  cache.set(cls.id, lines);
+  return lines;
+}
+
+function tsFieldDeclaration(
+  cls: Node,
+  field: string,
+  context: ResolutionContext
+): { valueType: boolean; type: string } | null {
+  let memo = TS_FIELD_DECL_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    TS_FIELD_DECL_MEMO.set(context, memo);
+  }
+  const key = cls.id + '\0' + field;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let found: { valueType: boolean; type: string } | null = null;
+  const lines = tsClassDeclLines(cls, context);
+  if (lines) {
+    const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // A word boundary cannot open a private name; it also lets a public
+    // `items` match `#items`. Keep the two field namespaces distinct (#1987).
+    const fieldStart = '(?<![\\w$#])';
+    const patterns: Array<{ re: RegExp; valueType: boolean }> = [
+      // `storage: typeof DraftHubStorage` — the type OF a value: an object
+      // literal used as a namespace. Its members are bare-named functions inside
+      // the constant's extent (#1573), so they are found by containment, not by
+      // `Type::method`. Tried first: the declared-type pattern below would
+      // otherwise capture the word `typeof`.
+      {
+        re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
+        valueType: true,
+      },
+      // `private readonly mailer?: Mailer` — a class field or a constructor
+      // parameter property; the capture stops at `<`, `[` or `|`, so a generic
+      // or union type yields its head and resolveMethodOnType decides.
+      {
+        re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
+        valueType: false,
+      },
+      // `mailer = new Mailer()` / `this.mailer = new Mailer()`
+      { re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
+    ];
+    scan: for (const line of lines) {
+      // Every pattern spells the field literally, so only a line that contains
+      // it can match — and most of a class's lines never mention a given field.
+      if (!line.includes(field)) continue;
+      for (const { re, valueType } of patterns) {
+        const m = line.match(re);
+        if (!m || !m[1]) continue;
+        found = { valueType, type: m[1] };
+        break scan;
+      }
+    }
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
  * Resolve a TS/JS `this.<field>.<method>()` call (#1496) through the field's
  * declared type, read off the ENCLOSING class's own declaration lines:
  * a field or constructor-parameter property (`private mailer: Mailer`,
@@ -3340,83 +3432,51 @@ function matchTsThisFieldCall(
   const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
     (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
   );
-  const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // A word boundary cannot open a private name; it also lets a public
-  // `items` match `#items`. Keep the two field namespaces distinct (#1987).
-  const fieldStart = '(?<![\\w$#])';
-  const patterns: Array<{ re: RegExp; valueType: boolean }> = [
-    // `storage: typeof DraftHubStorage` — the type OF a value: an object
-    // literal used as a namespace. Its members are bare-named functions inside
-    // the constant's extent (#1573), so they are found by containment, not by
-    // `Type::method`. Tried first: the declared-type pattern below would
-    // otherwise capture the word `typeof`.
-    {
-      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
-      valueType: true,
-    },
-    // `private readonly mailer?: Mailer` — a class field or a constructor
-    // parameter property; the capture stops at `<`, `[` or `|`, so a generic
-    // or union type yields its head and resolveMethodOnType decides.
-    {
-      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
-      valueType: false,
-    },
-    // `mailer = new Mailer()` / `this.mailer = new Mailer()`
-    { re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
-  ];
   for (const cls of owners) {
-    const source = context.readFile(cls.filePath);
-    if (!source) continue;
-    const declLines = source.split('\n').slice(Math.max(0, cls.startLine - 1), cls.endLine);
-    for (const rawLine of declLines) {
-      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
-      for (const { re, valueType } of patterns) {
-        const m = line.match(re);
-        if (!m || !m[1]) continue;
-        if (valueType) {
-          // The value's declaration may live in another file (it is imported);
-          // the call site's file is preferred when several share the name.
-          const holderName = m[1].split('.').pop()!;
-          const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
-            (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
-          );
-          for (const holder of holders) {
-            const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
-            if (hit) return hit;
-          }
-          return null;
-        }
-        // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
-        const typeName = m[1].split('.').pop()!;
-        if (!/^[A-Z]/.test(typeName)) return null;
-        // Two apps in one repo may each declare a `UserService`. The bare-name
-        // path this replaces broke that tie by directory proximity, so keep the
-        // same signal: among the type's declarations of the method, prefer the
-        // one closest to the call site's directory (its own app), never index
-        // order. resolveMethodOnType still answers the single-declaration and
-        // supertype cases.
-        const declared = context
-          .getNodesByName(methodName)
-          .filter(
-            (n) =>
-              n.kind === 'method' &&
-              sameLanguageFamily(n.language, ref.language) &&
-              (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
-          );
-        if (declared.length > 1) {
-          const callDirs = ref.filePath.split('/').slice(0, -1);
-          const shared = (fp: string) => {
-            const dirs = fp.split('/').slice(0, -1);
-            let i = 0;
-            while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
-            return i;
-          };
-          const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
-          return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
-        }
-        return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
+    const decl = tsFieldDeclaration(cls, field, context);
+    if (!decl) continue;
+    if (decl.valueType) {
+      // The value's declaration may live in another file (it is imported);
+      // the call site's file is preferred when several share the name.
+      const holderName = decl.type.split('.').pop()!;
+      const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
+        (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
+      );
+      for (const holder of holders) {
+        const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
+        if (hit) return hit;
       }
+      return null;
     }
+    // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
+    const typeName = decl.type.split('.').pop()!;
+    if (!/^[A-Z]/.test(typeName)) return null;
+    // Two apps in one repo may each declare a `UserService`. The bare-name
+    // path this replaces broke that tie by directory proximity, so keep the
+    // same signal: among the type's declarations of the method, prefer the
+    // one closest to the call site's directory (its own app), never index
+    // order. resolveMethodOnType still answers the single-declaration and
+    // supertype cases.
+    const declared = context
+      .getNodesByName(methodName)
+      .filter(
+        (n) =>
+          n.kind === 'method' &&
+          sameLanguageFamily(n.language, ref.language) &&
+          (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
+      );
+    if (declared.length > 1) {
+      const callDirs = ref.filePath.split('/').slice(0, -1);
+      const shared = (fp: string) => {
+        const dirs = fp.split('/').slice(0, -1);
+        let i = 0;
+        while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
+        return i;
+      };
+      const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
+      return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
+    }
+    return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
   }
   return null;
 }
