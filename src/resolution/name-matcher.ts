@@ -948,8 +948,14 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
       // a parameter: every token before the name in the list is itself a
       // parameter (identifier, optional type, optional default) — so a string
       // argument containing the word cannot match.
+      // Each earlier parameter has exactly one parse: its first non-space
+      // character after the identifier picks the type (`?`/`:`), default (`=`)
+      // or bare alternative. Written as `(type)?(default)?\s*`, the same
+      // strings split several ways per parameter, and a failing search
+      // backtracked through every combination — 30-40s per name on a vscode
+      // test file whose helper takes nine `name: T = value` parameters.
       new RegExp(
-        '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*\\??\\s*:\\s*[^,()]+)?(?:\\s*=\\s*[^,()]+)?\\s*,\\s*)*' +
+        '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*(?:\\?\\s*)?:[^,()]+|\\s*=[^,()]+|\\s*),\\s*)*' +
           n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)'
       ).test(source) ||
       new RegExp('(?:^|[^\\w$.])' + n + '\\s*=>').test(source);
