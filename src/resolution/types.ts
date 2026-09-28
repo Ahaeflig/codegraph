@@ -90,6 +90,8 @@ export interface ResolutionResult {
 export interface ResolutionContext {
   /** Get all nodes in a file */
   getNodesInFile(filePath: string): Node[];
+  /** Whether any node in the file is exported (`getNodesInFile(f).some(n => n.isExported)`), as one indexed probe. */
+  fileHasExportedNode?(filePath: string): boolean;
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
   /** Get all nodes by qualified name */

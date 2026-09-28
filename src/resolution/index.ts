@@ -479,6 +479,11 @@ export class ReferenceResolver {
         return this.nodeCache.get(filePath)!;
       },
 
+      fileHasExportedNode: (filePath: string) => {
+        const cached = this.nodeCache.get(filePath);
+        return cached !== undefined ? cached.some((n) => n.isExported) : this.queries.fileHasExportedNode(filePath);
+      },
+
       getNodesByName: (name: string) => {
         const cached = this.nameCache.get(name);
         if (cached !== undefined) return cached;

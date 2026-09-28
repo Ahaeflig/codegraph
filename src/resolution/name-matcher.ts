@@ -709,15 +709,18 @@ function isSealedModule(filePath: string, context: ResolutionContext): boolean {
   }
   const hit = memo.get(filePath);
   if (hit !== undefined) return hit;
-  const source = context.readFile(filePath);
   // CommonJS assignments can execute inside template interpolations, which the
   // masker blanks. Keep the conservative raw-source exemption for those forms.
-  // Cheapest disqualifiers first: nearly every module exports a node, and
-  // masking the source is only needed to rule out the ones that don't. (The
-  // masker only blanks text, so no `import` in the source means none in code.)
+  // Cheapest disqualifiers first: nearly every module exports a node (asked
+  // without reading or decoding the file), and masking the source is only
+  // needed to rule out the ones that don't. (The masker only blanks text, so
+  // no `import` in the source means none in code.)
+  const exportsNode = context.fileHasExportedNode
+    ? context.fileHasExportedNode(filePath)
+    : context.getNodesInFile(filePath).some((n) => n.isExported);
+  const source = exportsNode ? null : context.readFile(filePath);
   const sealed =
-    source !== null && source.includes('import') &&
-    !context.getNodesInFile(filePath).some((n) => n.isExported) &&
+    !exportsNode && source !== null && source.includes('import') &&
     !HAS_CJS_EXPORT.test(source) &&
     (() => {
       const code = blankStringContents(stripCommentsForRegex(source, 'typescript'));
@@ -936,12 +939,31 @@ function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boo
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
     ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
   if (line === undefined) return false;
-  const at = line.slice(ref.column);
-  const nameEsc = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (!new RegExp('^' + nameEsc + '\\s*[(<]').test(at)) return false;
-  // Nothing but whitespace, an operator or an opener may precede a bare call.
-  return !/[.\w$\]\)]\s*$/.test(line.slice(0, ref.column)) || /\b(?:return|await|yield|typeof|void|new|else|case|throw|in|of|instanceof|go|defer)\s*$/.test(line.slice(0, ref.column));
+  // `^<name>\s*[(<]` at the call's column, without compiling a pattern per call.
+  if (!line.startsWith(ref.referenceName, ref.column)) return false;
+  CALL_OPENER.lastIndex = ref.column + ref.referenceName.length;
+  if (!CALL_OPENER.test(line)) return false;
+  // Nothing but whitespace, an operator or an opener may precede a bare call:
+  // read the text before the column backwards, past trailing whitespace,
+  // instead of end-anchoring a pattern that scans the prefix from its start.
+  let end = Math.min(ref.column, line.length);
+  while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
+  if (end === 0 || !RECEIVER_TAIL_CHAR.test(line[end - 1]!)) return true;
+  let start = end;
+  while (start > 0 && WORD_CHAR.test(line[start - 1]!)) start--;
+  return BARE_CALL_KEYWORDS.has(line.slice(start, end));
 }
+
+/** `\s*[(<]` from a given index (sticky). */
+const CALL_OPENER = /\s*[(<]/y;
+const WHITESPACE = /\s/;
+const WORD_CHAR = /\w/;
+/** A character that ends a receiver: `.`, a word character, `$`, `]` or `)`. */
+const RECEIVER_TAIL_CHAR = /[.\w$\])]/;
+/** Keywords after which a name starts an expression, so the call has no receiver. */
+const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
+  'return', 'await', 'yield', 'typeof', 'void', 'new', 'else', 'case', 'throw', 'in', 'of', 'instanceof', 'go', 'defer',
+]);
 
 /** Per-context memo: `file\0name` → "the file binds this name locally". */
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
