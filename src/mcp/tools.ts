@@ -1166,6 +1166,8 @@ export type ExploreWantedSpan = {
   end: number;
   importance: number;
   spine: boolean;
+  /** The indexed qualified name (`SQLCompiler::as_sql`), when the span is a node. */
+  qualifiedName?: string;
 };
 
 /**
@@ -1208,6 +1210,19 @@ const TRIMMED_SYMBOLS_NAMED = 4;
 const TRIMMED_NAME_SKIP_KINDS = new Set([
   'file', 'module', 'namespace', 'class', 'struct', 'union', 'interface', 'protocol', 'trait',
 ]);
+
+/**
+ * The name the completeness note offers for an elided symbol: `Owner.member`
+ * for a method, so an overloaded name resolves to the definition that was cut
+ * (django has 110 `as_sql`s; the note used to offer the bare one and agents
+ * then added a path and line to disambiguate it). The bare name otherwise.
+ */
+function followUpName(e: ExploreWantedSpan): string {
+  if (e.kind !== 'method' || !e.qualifiedName) return e.name;
+  const segs = e.qualifiedName.split('::');
+  const owner = segs.length >= 2 ? segs[segs.length - 2]! : '';
+  return /^[A-Za-z_$][\w$]*$/.test(owner) ? `${owner}.${e.name}` : e.name;
+}
 
 /**
  * The shortest trailing slice of each path that no other path in `paths`
@@ -1258,7 +1273,8 @@ export function exploreCompletenessNotes(
     for (const e of t.elided) {
       if (names.length >= TRIMMED_SYMBOLS_NAMED) break;
       if (!(e.spine || e.importance >= 9) || TRIMMED_NAME_SKIP_KINDS.has(e.kind)) continue;
-      if (!names.includes(e.name)) names.push(e.name);
+      const name = followUpName(e);
+      if (!names.includes(name)) names.push(name);
     }
   }
   const head = `> **Verbatim source for ${filesIncluded} files is included above — treat it as already Read.**`;
@@ -5970,6 +5986,7 @@ export class ToolHandler {
               end: n.endLine,
               importance: entryNodeIds.has(n.id) ? 10 : flow.namedNodeIds.has(n.id) ? 9 : 1,
               spine: flow.pathNodeIds.has(n.id),
+              qualifiedName: n.qualifiedName,
             })),
             fullBody: withTail(skel),
             fullRanges: skel.map((p) => p.range),
@@ -6176,7 +6193,7 @@ export class ToolHandler {
       // qualified `SQLCompiler.as_sql` is no longer outranked by a denser cluster
       // around `SQLInsertCompiler.as_sql` that merely matched the bare name.
       const EXACT_IMPORTANCE = 11;
-      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number }> = [...rangeNodes.values()]
+      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number; qualifiedName?: string }> = [...rangeNodes.values()]
         // Drop whole-file envelope nodes (containers covering >50% of the file).
         .filter(n => !(ENVELOPE_KINDS.has(n.kind) && (n.endLine - n.startLine + 1) > fileLines.length * 0.5))
         .map(n => {
@@ -6191,7 +6208,7 @@ export class ToolHandler {
           // processRunExecutionData, the named flow ENTRY at L1562, is a large
           // low-density method that lost the budget to denser blocks and got cut, so
           // the agent Read it back — the very thing explore exists to prevent).
-          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id) };
+          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id), qualifiedName: n.qualifiedName };
         });
 
       // Add edge source locations in this file — captures template references

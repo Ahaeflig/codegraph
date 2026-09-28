@@ -123,6 +123,21 @@ describe('exploreCompletenessNotes', () => {
     expect(notes[0]).not.toContain('helperNobodyAskedFor');
   });
 
+  it('offers an elided method as Owner.member, so an overloaded name reaches the one that was cut', () => {
+    const q = (s: ExploreWantedSpan, qualifiedName: string): ExploreWantedSpan => ({ ...s, qualifiedName });
+    const trimmed = [{
+      filePath: 'django/db/models/sql/compiler.py',
+      elided: [
+        q(span('as_sql', 776, 1003, 9, true), 'SQLCompiler::as_sql'),
+        q(span('PLUGIN_ID', 5, 5, 9, false, 'method'), 'org.lamport.tla::HelpActivator::PLUGIN_ID'),
+        q(span('inner', 40, 44, 9, false, 'function'), 'Outer::run::inner'), // a local function keeps its bare name
+        q(span('odd', 50, 52, 9), 'src/a.py::odd'), // a path is no owner
+      ],
+    }];
+    const [note] = exploreCompletenessNotes(1, trimmed, ['django/db/models/sql/compiler.py']);
+    expect(note).toContain('(e.g. `SQLCompiler.as_sql`, `HelpActivator.PLUGIN_ID`, `inner`, `odd`)');
+  });
+
   it('offers candidates from most to least specific, the last no longer than the note it replaced', () => {
     const trimmed = ['a', 'b', 'c', 'd', 'e'].map((n) => ({
       filePath: `packages/${n}/src/deeply/nested/${n}Service.ts`,
