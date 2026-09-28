@@ -495,9 +495,8 @@ async function arkuiStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContex
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  for (const struct of queries.iterateNodesByKind('struct')) {
+  for (const struct of queries.iterateNodesByKindIn('struct', ['arkts'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (struct.language !== 'arkts') continue;
     const children = queries.getOutgoingEdges(struct.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n);
@@ -832,18 +831,15 @@ async function goImplementsEdges(queries: QueryBuilder, onYield: MaybeYield): Pr
   // never the whole struct kind — that array is O(nodes) on struct-heavy
   // repos like the Linux kernel (#1212).
   const goStructs: Node[] = [];
-  for (const s of queries.iterateNodesByKind('struct')) {
+  for (const s of queries.iterateNodesByKindIn('struct', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (s.language === 'go') goStructs.push(s);
+    goStructs.push(s);
   }
   const structMethods = new Map<string, Set<string>>();
   for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
 
-  for (const iface of queries.iterateNodesByKind('interface')) {
+  for (const iface of queries.iterateNodesByKindIn('interface', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-
-    if ((++scanned255 & 63) === 0) await onYield();
-    if (iface.language !== 'go') continue;
     const want = methodNameSet(iface.id);
     if (want.size === 0) continue; // empty interface (`any`) — would match everything
     let added = 0;
@@ -905,11 +901,8 @@ async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: Ma
     return i >= 0 ? p.slice(0, i) : '';
   };
 
-  for (const method of queries.iterateNodesByKind('method')) {
+  for (const method of queries.iterateNodesByKindIn('method', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-
-    if ((++scanned255 & 63) === 0) await onYield();
-    if (method.language !== 'go') continue;
     // The receiver type is encoded in the method's qualifiedName as `Recv::name`
     // (extraction sets `${receiverType}::${name}` for receiver methods).
     const qn = method.qualifiedName;
@@ -1128,9 +1121,8 @@ async function goGrpcStubImplEdges(queries: QueryBuilder, onYield: MaybeYield): 
   const methodNamesByStruct = new Map<string, Set<string>>();
   const methodNodesByStruct = new Map<string, Node[]>();
   const goStructs: Node[] = [];
-  for (const s of queries.iterateNodesByKind('struct')) {
+  for (const s of queries.iterateNodesByKindIn('struct', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (s.language !== 'go') continue;
     goStructs.push(s);
     const ms = queries
       .getOutgoingEdges(s.id, ['contains'])
@@ -1762,9 +1754,8 @@ async function rnCrossPlatformEdges(queries: QueryBuilder, onYield: MaybeYield):
   // impls in ≥2 native languages can pair, so the per-method JS-caller check
   // below only runs for genuine cross-platform candidates.
   const byName = new Map<string, Node[]>();
-  for (const m of queries.iterateNodesByKind('method')) {
+  for (const m of queries.iterateNodesByKindIn('method', [...NATIVE])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (!NATIVE.has(m.language)) continue;
     const key = norm(m.name);
     const arr = byName.get(key);
     if (arr) arr.push(m);
@@ -1886,17 +1877,16 @@ async function mybatisJavaXmlEdges(queries: QueryBuilder, onYield: MaybeYield): 
   // stream below. Same rowid stream order as matching inline, so the edge
   // output is byte-identical when mappers do exist.
   const xmlMethods: Node[] = [];
-  for (const m of queries.iterateNodesByKind('method')) {
+  for (const m of queries.iterateNodesByKindIn('method', ['xml'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (m.language === 'xml') xmlMethods.push(m);
+    xmlMethods.push(m);
   }
   if (xmlMethods.length === 0) return edges;
 
   // Index Java methods by `<ClassName>::<methodName>` for O(1) lookup.
   const javaIndex = new Map<string, Node[]>();
-  for (const m of queries.iterateNodesByKind('method')) {
+  for (const m of queries.iterateNodesByKindIn('method', ['java', 'kotlin'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (m.language !== 'java' && m.language !== 'kotlin') continue;
     const parts = m.qualifiedName.split('::');
     const last = parts[parts.length - 1];
     const cls = parts[parts.length - 2];
@@ -2005,9 +1995,8 @@ async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionCon
   let scannedFiles = 0;
   // 1. Find the chain dispatcher(s): a Go method that invokes a `handlers` slice by index.
   const dispatchers: Node[] = [];
-  for (const n of queries.iterateNodesByKind('method')) {
+  for (const n of queries.iterateNodesByKindIn('method', ['go'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (n.language !== 'go') continue;
     const content = ctx.readFile(n.filePath);
     const src = content && sliceLines(content, n.startLine, n.endLine);
     if (src && GIN_DISPATCH_RE.test(src)) dispatchers.push(n);
@@ -3185,10 +3174,9 @@ async function nixOptionPathEdges(queries: QueryBuilder, onYield: MaybeYield): P
   const byFile = new Map<string, Rec[]>();
   let scanned = 0;
   for (const kind of ['variable', 'function'] as NodeKind[]) {
-    for (const node of queries.iterateNodesByKind(kind)) {
+    for (const node of queries.iterateNodesByKindIn(kind, ['nix'])) {
       if ((++scanned255 & 63) === 0) await onYield();
       if ((++scanned & 0x3fff) === 0 && onYield) await onYield();
-      if (node.language !== 'nix') continue;
       const segs = nixLeadingPlainSegments(node.name);
       if (segs.length === 0) continue;
       const rec: Rec = {
@@ -3298,9 +3286,9 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
   // Cheap language gate: no Erlang modules → no cost beyond one streamed
   // kind scan (never a materialized array of every namespace — #1212).
   const erlangModules: Node[] = [];
-  for (const n of queries.iterateNodesByKind('namespace')) {
+  for (const n of queries.iterateNodesByKindIn('namespace', ['erlang'])) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (n.language === 'erlang') erlangModules.push(n);
+    erlangModules.push(n);
   }
   if (erlangModules.length === 0) return [];
 

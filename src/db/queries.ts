@@ -1181,6 +1181,23 @@ export class QueryBuilder {
   }
 
   /**
+   * iterateNodesByKind narrowed to some languages, in the same canonical
+   * order — the ORDER BY is total (`id` is unique), so this yields exactly the
+   * nodes a caller filtering iterateNodesByKind by language would keep, in the
+   * same sequence. A Go pass on a TypeScript monorepo otherwise materialized
+   * every method in the project to find a couple of Go ones.
+   */
+  *iterateNodesByKindIn(kind: NodeKind, languages: readonly string[]): IterableIterator<Node> {
+    if (languages.length === 0) return;
+    const stmt = this.db.prepare(
+      `SELECT * FROM nodes WHERE kind = ? AND language IN (${languages.map(() => '?').join(', ')}) ORDER BY file_path, start_line, id`
+    );
+    for (const row of stmt.iterate(kind, ...languages)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
    * Get all nodes in the database
    */
   getAllNodes(): Node[] {
