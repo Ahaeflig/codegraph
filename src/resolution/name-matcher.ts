@@ -992,27 +992,24 @@ export function matchByExactName(
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
   }
-  const candidates = context.getNodesByName(ref.referenceName)
+  // Every rule below judges one candidate on its own, so they run as ONE pass,
+  // the kind/language checks before the ones that read source: a common name
+  // has thousands of same-named nodes, and a chain of filters copied that
+  // list once per rule for every reference.
+  const cMacroCall = ref.referenceKind === 'calls' && (ref.language === 'c' || ref.language === 'cpp');
+  const valueRef = ref.referenceKind === 'references' || ref.referenceKind === 'function_ref';
+  const importRef = ref.referenceKind === 'imports';
+  const inheritanceRef = isInheritanceRef(ref);
+  const candidates = context.getNodesByName(ref.referenceName).filter((n) =>
     // Macro constants are not callees and must not consume the same-name
     // ceiling (#1839). Keep upstream's language gate on the chosen result.
-    .filter((n) => !(ref.referenceKind === 'calls' &&
-      (ref.language === 'c' || ref.language === 'cpp') &&
-      n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? '')))
+    !(cMacroCall && n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? '')) &&
     // Type/value references retain same-family eligibility: a native namesake
     // must not hide the actual web type. Calls still gate only the winner.
-    .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
-      sameLanguageFamily(n.language, ref.language))
-    .filter((n) => n.kind !== 'import')
-    // Nested locals are only reachable from inside their container (#1230).
-    .filter((n) => isLexicallyReachable(n, ref, context))
-    // Preserve import ranking; calls reject the winner without promoting another.
-    .filter((n) => ref.referenceKind !== 'imports' || n.filePath === ref.filePath ||
-      !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context))
+    (!valueRef || sameLanguageFamily(n.language, ref.language)) &&
+    n.kind !== 'import' &&
     // A receiver-less JS/TS or Go call cannot reach a method (#1714, #1857).
-    .filter((n) => !((bareJs || bareGo) && n.kind === 'method'))
-    // A name the file binds itself (a parameter, a const) shadows every other
-    // file's symbol of that name, so a bare call has no cross-file candidate.
-    .filter((n) => !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))
+    !((bareJs || bareGo) && n.kind === 'method') &&
     // An `extends`/`implements` ref names a supertype, so anything that can't
     // BE one is not a candidate at all. This is eligibility, not
     // ranking: kind is only a scoring bonus below (and none is awarded for
@@ -1020,11 +1017,20 @@ export function matchByExactName(
     // the real `trait`, and as the sole candidate was adopted outright by the
     // single-match shortcut. Restricting the pool BEFORE ranking lets the
     // legitimate supertype win instead of merely dropping the false edge.
-    .filter((n) => !isInheritanceRef(ref) || isSupertypeTarget(n))
+    (!inheritanceRef || isSupertypeTarget(n)) &&
     // Likewise for `imports`: a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
-    .filter((n) => ref.referenceKind !== 'imports' || isImportableKind(n.kind));
+    (!importRef || isImportableKind(n.kind)) &&
+    // Nested locals are only reachable from inside their container (#1230).
+    isLexicallyReachable(n, ref, context) &&
+    // Preserve import ranking; calls reject the winner without promoting another.
+    (!importRef || n.filePath === ref.filePath ||
+      !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context)) &&
+    // A name the file binds itself (a parameter, a const) shadows every other
+    // file's symbol of that name, so a bare call has no cross-file candidate.
+    !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
+  );
 
   if (candidates.length === 0) {
     return null;
@@ -1169,6 +1175,12 @@ export function matchByQualifiedName(
   }
 
   return null;
+}
+
+/** A node a `Receiver.method()` call can name as the method's owning type. */
+function isMethodOwnerKind(n: Node): boolean {
+  return n.kind === 'class' || n.kind === 'struct' || n.kind === 'union' || n.kind === 'interface' ||
+    (n.language === 'scala' && n.kind === 'module');
 }
 
 /**
@@ -2906,7 +2918,8 @@ export function matchMethodCall(
   // cross-file use reaches the same helper through the import path.
   if (dotMatch && !objectOrClass!.includes('.') && OBJECT_LITERAL_LANGUAGES.has(ref.language)) {
     const literalMatch = nmTimedT('mc-literal', ref, (): ResolvedRef | null => {
-      const holders = preferCallSiteFile(context.getNodesByName(objectOrClass!), ref.filePath).filter(
+      // Same-file holders only, so the call-site-first ordering is moot.
+      const holders = context.getNodesByName(objectOrClass!).filter(
         (n) => (n.kind === 'constant' || n.kind === 'variable') && n.filePath === ref.filePath
       );
       for (const holder of holders) {
@@ -2927,31 +2940,29 @@ export function matchMethodCall(
   // resolves to `a/`'s method (#1079).
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
     const classCandidates = preferCallSiteFile(
-      context.getNodesByName(objectOrClass!),
+      context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind),
       ref.filePath,
     );
 
     for (const classNode of classCandidates) {
-      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'union' || classNode.kind === 'interface' || (classNode.language === 'scala' && classNode.kind === 'module')) {
-        // Skip cross-language class matches
-        if (classNode.language !== ref.language) continue;
+      // Skip cross-language class matches
+      if (classNode.language !== ref.language) continue;
 
-        const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find(
-          (n) =>
-            n.kind === 'method' &&
-            n.name === methodName &&
-            n.qualifiedName.includes(classNode.name)
-        );
+      const nodesInFile = context.getNodesInFile(classNode.filePath);
+      const methodNode = nodesInFile.find(
+        (n) =>
+          n.kind === 'method' &&
+          n.name === methodName &&
+          n.qualifiedName.includes(classNode.name)
+      );
 
-        if (methodNode) {
-          return {
-            original: ref,
-            targetNodeId: methodNode.id,
-            confidence: 0.85,
-            resolvedBy: 'qualified-name',
-          };
-        }
+      if (methodNode) {
+        return {
+          original: ref,
+          targetNodeId: methodNode.id,
+          confidence: 0.85,
+          resolvedBy: 'qualified-name',
+        };
       }
     }
     return null;
@@ -2972,30 +2983,28 @@ export function matchMethodCall(
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
       const fuzzyClassCandidates = preferCallSiteFile(
-        context.getNodesByName(capitalizedReceiver),
+        context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind),
         ref.filePath,
       );
       for (const classNode of fuzzyClassCandidates) {
-        if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'union' || classNode.kind === 'interface' || (classNode.language === 'scala' && classNode.kind === 'module')) {
-          // Skip cross-language class matches
-          if (classNode.language !== ref.language) continue;
+        // Skip cross-language class matches
+        if (classNode.language !== ref.language) continue;
 
-          const nodesInFile = context.getNodesInFile(classNode.filePath);
-          const methodNode = nodesInFile.find(
-            (n) =>
-              n.kind === 'method' &&
-              n.name === methodName &&
-              n.qualifiedName.includes(classNode.name)
-          );
+        const nodesInFile = context.getNodesInFile(classNode.filePath);
+        const methodNode = nodesInFile.find(
+          (n) =>
+            n.kind === 'method' &&
+            n.name === methodName &&
+            n.qualifiedName.includes(classNode.name)
+        );
 
-          if (methodNode) {
-            return {
-              original: ref,
-              targetNodeId: methodNode.id,
-              confidence: 0.8,
-              resolvedBy: 'instance-method',
-            };
-          }
+        if (methodNode) {
+          return {
+            original: ref,
+            targetNodeId: methodNode.id,
+            confidence: 0.8,
+            resolvedBy: 'instance-method',
+          };
         }
       }
       return null;
