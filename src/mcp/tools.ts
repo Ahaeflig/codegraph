@@ -1288,6 +1288,73 @@ export function exploreCompletenessNotes(
   return candidates;
 }
 
+/** Chars a block of lines costs once joined into the response. */
+const roomForLines = (block: readonly string[]): number =>
+  block.reduce((n, s) => n + s.length + 1, 0);
+
+/**
+ * Fit the completeness note and the pointer list into the room the response has
+ * left (CG-26). Returns the note (a candidate block, or none), the pointer
+ * block, and the room that remains.
+ *
+ * The note is one of `noteCandidates`, most specific first. A complete-source
+ * note keeps the precedence it always had and goes first. A note that YIELDS (a
+ * trimmed one) gives way to the pointer list, which names files the response
+ * does not show at all, while what a trimmed section elided is already named in
+ * its own gap markers and header. It leaves the list's header and first entry
+ * when that much could fit, and its optional detail never costs an entry the
+ * least specific candidate would have left.
+ */
+export function fitExploreEpilogue(opts: {
+  room: number;
+  noteCandidates: ReadonlyArray<readonly string[]>;
+  noteYields: boolean;
+  pointerEntries: readonly string[];
+  pointerOmitted: number;
+}): { note: string[]; pointers: string[]; room: number } {
+  const { noteCandidates, noteYields, pointerEntries, pointerOmitted } = opts;
+  let room = opts.room;
+  // The pointer list as it fits `space`: entries in rank order, and a tail
+  // line confessing every entry left out.
+  const fitPointers = (space: number): { block: string[]; taken: number } => {
+    if (pointerEntries.length === 0) return { block: [], taken: 0 };
+    const head = [POINTER_HEADER, ''];
+    let left = space - roomForLines(head);
+    if (left < 0) return { block: [], taken: 0 };
+    let taken = 0;
+    for (const entry of pointerEntries) {
+      // Every entry we do NOT take has to be confessed by the tail line, so
+      // the tail's cost is part of taking one less than all of them.
+      const dropped = pointerEntries.length - taken - 1 + pointerOmitted;
+      const tail = dropped > 0 ? roomForLines([`- ... and ${dropped} more files`]) : 0;
+      if (entry.length + 1 + tail > left) break;
+      left -= entry.length + 1;
+      taken++;
+    }
+    if (taken === 0) return { block: [], taken: 0 };
+    const block = [...head, ...pointerEntries.slice(0, taken)];
+    const dropped = pointerEntries.length - taken + pointerOmitted;
+    if (dropped > 0) block.push(`- ... and ${dropped} more files`);
+    return { block, taken };
+  };
+
+  const pointerNeed = pointerEntries.length > 0
+    ? roomForLines([POINTER_HEADER, '', pointerEntries[0]!,
+      `- ... and ${pointerEntries.length - 1 + pointerOmitted} more files`])
+    : 0;
+  const pointerMin = noteYields && pointerNeed <= room ? pointerNeed : 0;
+  const leastSpecific = noteCandidates[noteCandidates.length - 1];
+  const entriesBeside = (b: readonly string[]) => fitPointers(room - roomForLines(b)).taken;
+  const entriesFloor = noteYields && leastSpecific ? entriesBeside(leastSpecific) : 0;
+  const note = [...(noteCandidates.find((b) => roomForLines(b) + pointerMin <= room
+    && (!noteYields || entriesBeside(b) >= entriesFloor)) ?? [])];
+  room -= roomForLines(note);
+
+  const pointers = fitPointers(room).block;
+  room -= roomForLines(pointers);
+  return { note, pointers, room };
+}
+
 /**
  * Match response delimiters rather than ASCII "path characters": filenames
  * can contain Unicode, @, +, and other punctuation. Keep line references and
@@ -7185,56 +7252,24 @@ export class ToolHandler {
     // one thing: a fixed floor the loop reserves for (the cut note, plus a
     // pointer for every file whose bytes were deliberately WITHHELD — CG-12
     // makes those names load-bearing) and an elastic tail that takes what is
-    // left. Assembled in priority order — the do-not-re-read reminder first,
-    // then pointers in rank order, then the budget note — and emitted in
-    // document order.
-    const roomFor = (block: readonly string[]): number =>
-      block.reduce((n, s) => n + s.length + 1, 0);
+    // left. Assembled in priority order — the completeness note and the
+    // pointers by `fitExploreEpilogue`'s rules, then the budget note — and
+    // emitted in document order.
+    const roomFor = roomForLines;
     // Less what the summary line will grow by when its sentinel is filled in.
     let room = hardCeiling - (flow.text.length + lines.join('\n').length)
       - Math.max(0, summaryReserve - SUMMARY_SENTINEL.length);
 
-    // The most specific candidate that fits. A complete-source note keeps the
-    // precedence it always had. A TRIMMED note yields the pointer list's header
-    // and first entry when that much could fit: the list names files this
-    // response does not show at all, while what a trimmed section elided is
-    // already named in its own gap markers and header. It then gets a second
-    // try at whatever the list leaves.
-    const pointerNeed = pointerEntries.length > 0
-      ? roomFor([POINTER_HEADER, '', pointerEntries[0]!,
-        `- ... and ${pointerEntries.length - 1 + pointerOmitted} more files`])
-      : 0;
-    const pointerMin = trimmedShown.length > 0 && pointerNeed <= room ? pointerNeed : 0;
-    let completenessBlock = completenessCandidates.find((b) => roomFor(b) + pointerMin <= room) ?? [];
-    room -= roomFor(completenessBlock);
-
-    const pointerBlock: string[] = [];
-    if (pointerEntries.length > 0) {
-      const head = [POINTER_HEADER, ''];
-      let left = room - roomFor(head);
-      if (left >= 0) {
-        let taken = 0;
-        for (const entry of pointerEntries) {
-          // Every entry we do NOT take has to be confessed by the tail line, so
-          // the tail's cost is part of taking one less than all of them.
-          const dropped = pointerEntries.length - taken - 1 + pointerOmitted;
-          const tail = dropped > 0 ? roomFor([`- ... and ${dropped} more files`]) : 0;
-          if (entry.length + 1 + tail > left) break;
-          left -= entry.length + 1;
-          taken++;
-        }
-        if (taken > 0) {
-          pointerBlock.push(...head, ...pointerEntries.slice(0, taken));
-          const dropped = pointerEntries.length - taken + pointerOmitted;
-          if (dropped > 0) pointerBlock.push(`- ... and ${dropped} more files`);
-          room -= roomFor(pointerBlock);
-        }
-      }
-    }
-    if (completenessBlock.length === 0) {
-      completenessBlock = completenessCandidates.find((b) => roomFor(b) <= room) ?? [];
-      room -= roomFor(completenessBlock);
-    }
+    const fitted = fitExploreEpilogue({
+      room,
+      noteCandidates: completenessCandidates,
+      noteYields: trimmedShown.length > 0,
+      pointerEntries,
+      pointerOmitted,
+    });
+    const completenessBlock = fitted.note;
+    const pointerBlock = fitted.pointers;
+    room = fitted.room;
     const keepCompleteness = completenessBlock.length > 0;
     // Nothing of the pointer list survived, but there WAS one — say so, in the
     // one line that carries its instruction forward.

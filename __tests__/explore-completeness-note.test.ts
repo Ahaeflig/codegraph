@@ -23,6 +23,7 @@ import {
   ToolHandler,
   elidedWantedSpans,
   exploreCompletenessNotes,
+  fitExploreEpilogue,
   shortestUniqueSuffixes,
   type ExploreWantedSpan,
 } from '../src/mcp/tools';
@@ -151,6 +152,62 @@ describe('exploreCompletenessNotes', () => {
     // The last resort names nothing, so wherever the old note fit, it fits.
     expect(notes[2]).not.toContain('Service.ts');
     expect(notes[2]!.length).toBeLessThan(OLD_NOTE.length);
+  });
+});
+
+describe('fitExploreEpilogue — the note and the pointer list share what is left', () => {
+  const cost = (b: readonly string[]) => b.reduce((n, l) => n + l.length + 1, 0);
+  const entries = ['a', 'b', 'c', 'd', 'e'].map((n) => `- src/${n}/${n.repeat(40)}.ts: ${n}Handler:10, ${n}Helper:40`);
+  const note = (len: number) => ['', '---', `> ${'x'.repeat(len)}`];
+  const names = note(470);
+  const files = note(390);
+  const generic = note(330);
+  const fit = (room: number, noteCandidates: string[][], noteYields: boolean) =>
+    fitExploreEpilogue({ room, noteCandidates, noteYields, pointerEntries: entries, pointerOmitted: 20 });
+  const entriesIn = (block: readonly string[]) => block.filter((l) => l.startsWith('- src/')).length;
+  /** Room for exactly `k` pointer entries (header, entries and tail) beside `withNote`. */
+  const roomFor = (k: number, withNote: readonly string[] = []) => {
+    const full = fit(1e6, [], false).pointers;
+    const header = full.slice(0, 2);
+    return cost(withNote) + cost([...header, ...entries.slice(0, k), `- ... and ${entries.length - k + 20} more files`]);
+  };
+
+  it('a complete-source note keeps its precedence over the pointer list', () => {
+    const complete = note(330);
+    const r = fit(cost(complete) + 20, [complete], false);
+    expect(r.note).toEqual(complete);
+    expect(r.pointers).toEqual([]);
+  });
+
+  it('a trimmed note leaves the pointer list its first entry', () => {
+    // The generic note fits alone, but not beside the list's first entry.
+    const room = cost(generic) + 20;
+    expect(room).toBeLessThan(roomFor(1, generic));
+    const r = fit(room, [names, files, generic], true);
+    expect(r.note).toEqual([]);
+    expect(entriesIn(r.pointers)).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a trimmed note's detail never costs a pointer entry", () => {
+    // Beside the generic note three entries fit; beside the named one, fewer.
+    const room = roomFor(3, generic);
+    const r = fit(room, [names, files, generic], true);
+    expect(r.note).toEqual(generic);
+    expect(entriesIn(r.pointers)).toBe(3);
+  });
+
+  it('takes the most specific note when it costs no entry', () => {
+    const r = fit(roomFor(5, names), [names, files, generic], true);
+    expect(r.note).toEqual(names);
+    expect(entriesIn(r.pointers)).toBe(5);
+  });
+
+  it('with no pointer list, takes the most specific note that fits', () => {
+    const r = fitExploreEpilogue({
+      room: cost(files) + 10, noteCandidates: [names, files, generic], noteYields: true, pointerEntries: [], pointerOmitted: 0,
+    });
+    expect(r.note).toEqual(files);
+    expect(r.pointers).toEqual([]);
   });
 });
 
