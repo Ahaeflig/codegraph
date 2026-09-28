@@ -1145,13 +1145,28 @@ function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
  */
 const EPILOGUE_LOST_NOTE = '> (Trailing pointer list omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
 /**
- * The same note when a section above was trimmed (see `elidedWantedSpans`):
- * it drops "complete", which would be false, and keeps the guarantee that is
- * still true. The epilogue floor is reserved before the render knows which of
- * the two it will need, so it reserves the longer; keeping this one no longer
- * than {@link EPILOGUE_LOST_NOTE} leaves the floor where it was.
+ * The notes that stand in for the epilogue, or close a truncated response, in
+ * two wordings each. `complete` says the source above is complete; `trimmed` is
+ * used when a section it vouches for was trimmed (see `elidedWantedSpans`) and
+ * drops that claim, keeping the guarantee that is still true. Each trimmed
+ * wording is no longer than its complete one: the epilogue floor (`lost`) and
+ * the cut note's fit test (`cut`) are sized before the render knows which of the
+ * two it will need.
  */
-const EPILOGUE_LOST_NOTE_TRIMMED = '> (Trailing pointer list omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)';
+export const EXPLORE_FALLBACK_NOTES = {
+  lost: {
+    complete: EPILOGUE_LOST_NOTE,
+    trimmed: '> (Trailing pointer list omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)',
+  },
+  cut: {
+    complete: '\n\n> (Trailing notes omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)',
+    trimmed: '\n\n> (Trailing notes omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)',
+  },
+  truncated: {
+    complete: '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)',
+    trimmed: '\n\n... (output truncated to budget; the source above is verbatim — treat it as already Read. For names its gap markers list, or any area not covered, run another codegraph_explore — do NOT Read these files.)',
+  },
+} as const;
 
 /**
  * One symbol a file section set out to deliver: a cluster member, or a symbol
@@ -1259,15 +1274,20 @@ export function shortestUniqueSuffixes(paths: ReadonlyArray<string>): Map<string
 export function exploreCompletenessNotes(
   filesIncluded: number,
   trimmed: ReadonlyArray<ExplorePartialFile>,
-  renderedPaths: ReadonlyArray<string>,
+  /** Every path the response can name (sections and pointer list); labels are unique among them. */
+  knownPaths: ReadonlyArray<string>,
 ): string[] {
+  // No count when every section is held from an earlier call: "0 files" reads
+  // as nothing shown, beside a note about what was shown.
+  const files = filesIncluded === 0 ? 'these files'
+    : filesIncluded === 1 ? '1 file' : `${filesIncluded} files`;
   if (trimmed.length === 0) {
-    return [`> **Complete source for ${filesIncluded} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading.`];
+    return [`> **Complete source for ${files} is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading.`];
   }
-  const label = shortestUniqueSuffixes([...renderedPaths, ...trimmed.map((t) => t.filePath)]);
+  const label = shortestUniqueSuffixes([...knownPaths, ...trimmed.map((t) => t.filePath)]);
   const shownFiles = trimmed.slice(0, TRIMMED_FILES_NAMED).map((t) => `\`${label.get(t.filePath)}\``);
   const moreFiles = trimmed.length - shownFiles.length;
-  const files = shownFiles.join(', ') + (moreFiles > 0 ? ` +${moreFiles} more` : '');
+  const trimmedList = shownFiles.join(', ') + (moreFiles > 0 ? ` +${moreFiles} more` : '');
   const names: string[] = [];
   for (const t of trimmed) {
     for (const e of t.elided) {
@@ -1277,10 +1297,10 @@ export function exploreCompletenessNotes(
       if (!names.includes(name)) names.push(name);
     }
   }
-  const head = `> **Verbatim source for ${filesIncluded} files is included above — treat it as already Read.**`;
+  const head = `> **Verbatim source for ${files} is included above — treat it as already Read.**`;
   const what = 'gap markers and file headers name what was elided';
   const tail = 'For those, or anything under "Not shown above", make ANOTHER codegraph_explore with those exact names instead of reading the files — it returns their source with line numbers.';
-  const withFiles = `${head} Trimmed for size: ${files}; ${what}`;
+  const withFiles = `${head} Trimmed for size: ${trimmedList}; ${what}`;
   const candidates = names.length > 0
     ? [`${withFiles} (e.g. ${names.map((n) => `\`${n}\``).join(', ')}). ${tail}`]
     : [];
@@ -5161,8 +5181,9 @@ export class ToolHandler {
         ? ` No indexed file uniquely matches ${unresolvedPathSpans.map((sp) => `\`${sp}\``).join(', ')}.`.length
         : 0)
       + setAsideNote.length;
-    const epilogueFloor = Math.max(EPILOGUE_LOST_NOTE.length, EPILOGUE_LOST_NOTE_TRIMMED.length)
-      + 2 + cliffPointerFloor + summaryReserve;
+    const epilogueFloor = Math.max(
+      EXPLORE_FALLBACK_NOTES.lost.complete.length, EXPLORE_FALLBACK_NOTES.lost.trimmed.length,
+    ) + 2 + cliffPointerFloor + summaryReserve;
     // Absolute stop for the render loop. Reservations already fit the envelope, so
     // this only catches their bounded overshoot (the whole-file grace, an oversize
     // first cluster) — and catches it HERE, where a file can be skipped cleanly and
@@ -5552,25 +5573,25 @@ export class ToolHandler {
         mode: 'whole' | 'clusters' | 'focused' | 'skeleton';
         clipped: boolean;
         /**
-         * The symbols this section set out to deliver. Any not covered by
-         * `ranges` + `covered` marks the file trimmed for the completeness note.
-         * Empty for a whole-file render: it has nothing left to elide.
+         * The symbols this section set out to deliver. Any not covered by what
+         * is sent (`ranges`, after the fold) plus `covered` marks the file
+         * trimmed for the completeness note.
          */
         wanted: ReadonlyArray<ExploreWantedSpan>;
         /** The undeduped render, kept for the no-new-source fallback. */
         fullBody: string;
         fullRanges: ExploreLineRange[];
       }): void => {
-        // Judged on the ranges BEFORE the fold below: a fold is dedup's
-        // presentation of a sub-MIN_DELTA_CHARS remainder, not a trim for size.
-        const elided = elidedWantedSpans(opts.wanted, [...opts.ranges, ...opts.covered]);
-        if (elided.length > 0) trimmedFiles.set(filePath, elided);
         // A remainder too small to be worth a fence is folded into the pointer
         // (see MIN_DELTA_CHARS). Its ranges are then NOT recorded — the record
         // must only ever claim source that was actually sent.
         const folded = opts.covered.length > 0 && opts.body.length < EXPLORE_DEDUP.MIN_DELTA_CHARS;
         const body = folded ? '' : opts.body;
         const ranges = folded ? [] : opts.ranges;
+        // Judged on what this call sends plus what the agent already holds —
+        // AFTER the fold, whose remainder is in neither.
+        const elided = elidedWantedSpans(opts.wanted, [...ranges, ...opts.covered]);
+        if (elided.length > 0) trimmedFiles.set(filePath, elided);
         const at = lines.length;
         lines.push(opts.header, '');
         // Charge what the section ACTUALLY costs, not a flat 200 (CG-26). A
@@ -5820,6 +5841,22 @@ export class ToolHandler {
       // doesn't Read the file back for it — Django's SQLCompiler.execute_sql/as_sql);
       // every other symbol is just its signature. So the base mechanism survives while
       // the file's other ~80 symbols + the redundant subclasses collapse to one line each.
+      // The symbols a section of this file sets out to deliver, for the
+      // completeness check (`elidedWantedSpans`), ranked the way the cluster
+      // path ranks its members.
+      // The file node is not one of them: no section delivers "the file" as a
+      // symbol, and it spans trailing lines no render prints.
+      const wantedFrom = (nodes: readonly Node[]): ExploreWantedSpan[] => nodes
+        .filter((n) => n.kind !== 'import' && n.kind !== 'export' && n.kind !== 'file' && n.startLine > 0)
+        .map((n) => ({
+          name: n.name,
+          kind: n.kind,
+          start: n.startLine,
+          end: n.endLine,
+          importance: entryNodeIds.has(n.id) ? 10 : flow.namedNodeIds.has(n.id) ? 9 : 1,
+          spine: flow.pathNodeIds.has(n.id),
+          qualifiedName: n.qualifiedName,
+        }));
       const spareNamed = group.nodes.some(n => flow.uniqueNamedNodeIds.has(n.id));
       const fileDefinesSuper = definesPolymorphicSupertype(group.nodes);
       const spared = spareNamed && !fileDefinesSuper;
@@ -6044,17 +6081,8 @@ export class ToolHandler {
             mode: bodyIds.size + bodyWindows.size > 0 ? 'focused' : 'skeleton',
             // Always "clipped": the per-symbol view elides bodies by construction.
             clipped: true,
-            // Every symbol whose body this view could have shown, ranked the way
-            // the cluster path ranks its members.
-            wanted: syms.map((n) => ({
-              name: n.name,
-              kind: n.kind,
-              start: n.startLine,
-              end: n.endLine,
-              importance: entryNodeIds.has(n.id) ? 10 : flow.namedNodeIds.has(n.id) ? 9 : 1,
-              spine: flow.pathNodeIds.has(n.id),
-              qualifiedName: n.qualifiedName,
-            })),
+            // Every symbol whose body this view could have shown.
+            wanted: wantedFrom(syms),
             fullBody: withTail(skel),
             fullRanges: skel.map((p) => p.range),
           });
@@ -6192,7 +6220,11 @@ export class ToolHandler {
             overhead: 200,
             mode: 'whole',
             clipped: false,
-            wanted: [],
+            // Sent whole, so nothing is elided — unless dedup folds a remainder
+            // the agent does not hold (`emitFileSection`). Clamped to the lines
+            // the render carries, which stop before trailing blank lines.
+            wanted: wantedFrom(group.nodes)
+              .map((w) => ({ ...w, end: Math.min(w.end, wholeRange.end) })),
             fullBody: fullSection,
             fullRanges: [wholeRange],
           });
@@ -7218,15 +7250,14 @@ export class ToolHandler {
       .filter((fp) => trimmedFiles.has(fp))
       .map((fp) => ({ filePath: fp, elided: trimmedFiles.get(fp)! }));
     const completenessCandidates: string[][] = budget.includeCompletenessSignal
-      ? exploreCompletenessNotes(filesIncluded, trimmedShown, renderedFilePaths)
+      ? exploreCompletenessNotes(filesIncluded, trimmedShown, [...renderedFilePaths, ...fileGroups.keys()])
         .map((note) => ['', '---', note])
       : anyFileTrimmed || trimmedShown.length > 0
         ? [['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]]
         : [];
-    /** A fallback note's wording, by whether any section it vouches for was trimmed. */
-    const sourceAboveIs = (text: string): 'complete and verbatim' | 'verbatim' =>
-      trimmedShown.some((t) => text.includes(`${FILE_SECTION_PREFIX}${t.filePath}\``))
-        ? 'verbatim' : 'complete and verbatim';
+    /** Whether a trimmed section survives in `text` — picks a fallback note's wording after a cut. */
+    const trimmedIn = (text: string): boolean =>
+      trimmedShown.some((t) => text.includes(`${FILE_SECTION_PREFIX}${t.filePath}\``));
 
     // Advisory exploration-guidance note based on project size. Deliberately
     // phrased as guidance, NOT a quota: agents read "budget / remaining calls /
@@ -7281,8 +7312,8 @@ export class ToolHandler {
     lines.push(...pointerBlock);
     if (keepCompleteness) lines.push(...completenessBlock);
     if (keepBudgetNote) lines.push(...budgetBlock);
-    const lostNote = sourceAboveIs(lines.join('\n')) === 'verbatim'
-      ? EPILOGUE_LOST_NOTE_TRIMMED : EPILOGUE_LOST_NOTE;
+    // Nothing has been cut yet, so every trimmed section is still in the response.
+    const lostNote = EXPLORE_FALLBACK_NOTES.lost[trimmedShown.length > 0 ? 'trimmed' : 'complete'];
     if (pointersLost && roomFor([lostNote, '']) <= room) {
       lines.push('', lostNote);
     }
@@ -7298,9 +7329,8 @@ export class ToolHandler {
     const epilogueOnlyCut = epilogueStart < lines.length
       ? flow.text + lines.slice(0, epilogueStart).join('\n')
       : null;
-    const EPILOGUE_CUT_NOTE = epilogueOnlyCut !== null && sourceAboveIs(epilogueOnlyCut) === 'verbatim'
-      ? '\n\n> (Trailing notes omitted for size. The source above is verbatim — treat it as already Read. For symbols its gap markers name, and anything else not covered, run another codegraph_explore with those names rather than reading.)'
-      : '\n\n> (Trailing notes omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
+    const EPILOGUE_CUT_NOTE = EXPLORE_FALLBACK_NOTES.cut[
+      epilogueOnlyCut !== null && trimmedIn(epilogueOnlyCut) ? 'trimmed' : 'complete'];
 
     if (output.length > hardCeiling
         && epilogueOnlyCut !== null
@@ -7317,9 +7347,7 @@ export class ToolHandler {
       const lastSection = cut.lastIndexOf('\n' + FILE_SECTION_PREFIX);
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
-      finalText = safe + (sourceAboveIs(safe) === 'verbatim'
-        ? '\n\n... (output truncated to budget; the source above is verbatim — treat it as already Read. For names its gap markers list, or any area not covered, run another codegraph_explore — do NOT Read these files.)'
-        : '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
+      finalText = safe + EXPLORE_FALLBACK_NOTES.truncated[trimmedIn(safe) ? 'trimmed' : 'complete'];
     } else {
       finalText = output;
     }

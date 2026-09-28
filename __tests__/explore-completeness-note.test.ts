@@ -21,7 +21,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
+import { ExploreSessionState } from '../src/mcp/explore-session-state';
 import {
+  EXPLORE_FALLBACK_NOTES,
   ToolHandler,
   elidedWantedSpans,
   exploreCompletenessNotes,
@@ -126,6 +128,23 @@ describe('exploreCompletenessNotes', () => {
     expect(notes[0]).not.toContain('helperNobodyAskedFor');
   });
 
+  it('counts files in words that read right for one and for none', () => {
+    const t = [{ filePath: 'a.ts', elided: [span('f', 1, 9, 9)] }];
+    expect(exploreCompletenessNotes(1, [], ['a.ts'])[0]).toContain('Complete source for 1 file is included');
+    expect(exploreCompletenessNotes(1, t, ['a.ts'])[0]).toContain('Verbatim source for 1 file is included');
+    // Every section held from an earlier call: no "0 files" beside a note about what was shown.
+    for (const note of exploreCompletenessNotes(0, t, ['a.ts'])) {
+      expect(note).not.toMatch(/\b0 files?\b/);
+      expect(note).toContain('Verbatim source for these files');
+    }
+  });
+
+  it('labels a trimmed file apart from a same-named file the pointer list names', () => {
+    const trimmed = [{ filePath: 'src/common/rpcProtocol.ts', elided: [span('f', 1, 9, 9)] }];
+    const [note] = exploreCompletenessNotes(1, trimmed, ['src/common/rpcProtocol.ts', 'src/node/rpcProtocol.ts']);
+    expect(note).toContain('`common/rpcProtocol.ts`');
+  });
+
   it('offers an elided method as Owner.member, so an overloaded name reaches the one that was cut', () => {
     const q = (s: ExploreWantedSpan, qualifiedName: string): ExploreWantedSpan => ({ ...s, qualifiedName });
     const trimmed = [{
@@ -154,6 +173,21 @@ describe('exploreCompletenessNotes', () => {
     // The last resort names nothing, so wherever the old note fit, it fits.
     expect(notes[2]).not.toContain('Service.ts');
     expect(notes[2]!.length).toBeLessThan(OLD_NOTE.length);
+  });
+});
+
+describe('EXPLORE_FALLBACK_NOTES', () => {
+  it.each(Object.entries(EXPLORE_FALLBACK_NOTES))('%s: the trimmed wording drops "complete" and is no longer', (_kind, note) => {
+    // The epilogue floor and the cut note's fit test are sized before the render
+    // knows which wording it needs.
+    expect(note.trimmed.length).toBeLessThanOrEqual(note.complete.length);
+    expect(note.complete).toContain('complete and verbatim');
+    expect(note.trimmed).not.toMatch(/\bcomplete\b/);
+    expect(note.trimmed).toContain('treat it as already Read');
+    for (const text of [note.complete, note.trimmed]) {
+      expect(text).toContain('codegraph_explore');
+      expect(text).not.toMatch(OFFERS_READ);
+    }
   });
 });
 
@@ -309,5 +343,66 @@ describe('codegraph_explore — the note follows what the render cut', () => {
   it('small tier: complete sections get no trimmed note', async () => {
     const text = await explore('formatValue padValue');
     expect(text).not.toContain('trimmed for size');
+  });
+});
+
+describe('codegraph_explore — a dedup remainder folded into the back-reference is not delivered', () => {
+  let dir: string;
+  let cg: CodeGraph;
+  let handler: ToolHandler;
+  let previousDedup: string | undefined;
+
+  beforeAll(async () => {
+    previousDedup = process.env.CODEGRAPH_EXPLORE_DEDUP;
+    process.env.CODEGRAPH_EXPLORE_DEDUP = '1';
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-completeness-fold-'));
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"cg-completeness-fold","version":"1.0.0"}\n');
+    const src = path.join(dir, 'src');
+    fs.mkdirSync(src);
+    // `loadLedger`, then a tiny unrelated `tinyTail` just below it, then filler far
+    // away so no tier ships the file whole. The first call sends `loadLedger` and
+    // its padding; the second adds `tinyTail`, whose few lines are the remainder
+    // dedup folds into the "Already sent" pointer instead of fencing them.
+    const body: string[] = ['export function loadLedger(rows: number[]): number {', '  let total = 0;'];
+    for (let i = 0; i < 30; i++) body.push(`  total += rows[${i}] ?? ${i};`);
+    // Past the first call's 3 lines of padding, inside the cluster gap.
+    body.push('  return total;', '}', '', '//', '//', '//', 'export const tinyTail = (): number => 7;', '');
+    for (let i = 0; i < 40; i++) {
+      body.push(`export function farFiller${i}(x: number): number {`);
+      for (let j = 0; j < 5; j++) body.push(`  x = x * ${j + 2} + ${i};`);
+      body.push('  return x;', '}', '');
+    }
+    fs.writeFileSync(path.join(src, 'ledger.ts'), body.join('\n'));
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    handler = new ToolHandler(cg);
+  }, 120_000);
+
+  afterAll(() => {
+    if (previousDedup === undefined) delete process.env.CODEGRAPH_EXPLORE_DEDUP;
+    else process.env.CODEGRAPH_EXPLORE_DEDUP = previousDedup;
+    cg?.destroy();
+    if (dir && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not call the file complete when the folded lines were never sent', async () => {
+    const spy = vi.spyOn(cg, 'getStats').mockReturnValue({ fileCount: 1000, nodeCount: 50 } as ReturnType<CodeGraph['getStats']>);
+    try {
+      const session = new ExploreSessionState();
+      const run = (query: string) =>
+        handler.execute('codegraph_explore', { query }, session).then((r) => r.content?.[0]?.text ?? '');
+      const first = await run('loadLedger');
+      expect(first).toContain('loadLedger');
+      expect(first).not.toContain('tinyTail = ()');
+      const second = await run('loadLedger tinyTail');
+      // The fixture reaches the fold: the section is a pointer, and `tinyTail`'s
+      // source is in neither response.
+      expect(second).toContain('Already sent earlier in this conversation');
+      expect(second).not.toContain('tinyTail = ()');
+      expect(second).not.toContain('Complete source for');
+      expect(second).toContain('Trimmed for size: `ledger.ts`');
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

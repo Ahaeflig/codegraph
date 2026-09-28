@@ -107,7 +107,10 @@ in either arm reads.
 - `shortestUniqueSuffixes`.
 - `exploreCompletenessNotes`: the complete case never offers Read; the trimmed case keeps the
   already-Read guarantee, names files and `Owner.member` names, and skips containers; candidates
-  shrink in order, and the last is shorter than the old line.
+  shrink in order, and the last is shorter than the old line; "1 file", never "0 files"; a trimmed
+  file's label stays distinct from a same-named file in the pointer list.
+- `EXPLORE_FALLBACK_NOTES`: each trimmed wording drops "complete", keeps the already-Read
+  guarantee, and is no longer than the wording the floor and the cut test were sized on.
 - `fitExploreEpilogue`:
   - a complete note keeps precedence;
   - a trimmed note leaves the first pointer entry;
@@ -115,6 +118,8 @@ in either arm reads.
   - with no pointer list, the most specific note that fits wins.
 - End to end on a three-hop flow whose spine method the render windows: the large tier reports it
   trimmed, the small tier agrees, and complete flows are still called complete.
+- End to end with dedup on: a second call whose new lines are too few to fence, and are folded
+  into the "Already sent" pointer, is reported trimmed rather than complete.
 
 Mutation-checked:
 
@@ -124,3 +129,4 @@ Mutation-checked:
 | Old Read sentence restored | both Read checks |
 | The entry rule dropped from the fit | "detail never costs a pointer entry" |
 | The first-entry reservation dropped | "a trimmed note leaves the pointer list its first entry" |
+| Completeness judged before the dedup fold | the folded-remainder test |
