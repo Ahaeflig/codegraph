@@ -45,6 +45,14 @@ const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
   'class', 'struct', 'interface', 'trait', 'protocol', 'enum',
 ]);
 
+/**
+ * The only edges resolving a reference reads (getSupertypes' walk). The batch
+ * loop commits a batch that made any of these before the next batch fans out;
+ * its other edges land while that batch resolves. A resolution strategy that
+ * reads another edge kind must be added here.
+ */
+const RESOLUTION_READ_EDGE_KINDS: Edge['kind'][] = ['implements', 'extends'];
+
 // SUPERTYPE_TARGET_KINDS (the kinds an extends/implements edge may TARGET)
 // lives in ./types — the name-matcher needs the same set to restrict its
 // candidate pool before ranking. It is deliberately wider than
@@ -712,7 +720,7 @@ export class ReferenceResolver {
         } else {
           const supertypes = new Set<string>();
           for (const tn of typeNodes) {
-            for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
+            for (const edge of this.queries.getOutgoingEdges(tn.id, RESOLUTION_READ_EDGE_KINDS)) {
               const target = this.nodeById(edge.target);
               if (target?.name && target.name !== typeName) supertypes.add(target.name);
             }
@@ -2050,16 +2058,23 @@ export class ReferenceResolver {
       const PERSIST_CHUNK = 1000;
       const tPersist = Date.now();
 
-      // Persist edges BEFORE fanning out the next batch: later batches read
-      // this batch's edges — resolveMethodOnType walks supertype chains over
-      // `extends`/`implements` edges that earlier batches resolved, so a
-      // receiver typed as a subclass only reaches a method declared on its
-      // base class if those edges are visible. (Validated on dubbo: fanning
-      // out first downgraded exactly those supertype-method resolutions from
-      // the 0.9 typed-receiver path to the 0.65 word-overlap fallback.)
+      // A batch that made `extends`/`implements` edges persists them BEFORE
+      // fanning out the next batch: later batches read them —
+      // resolveMethodOnType walks supertype chains over edges that earlier
+      // batches resolved, so a receiver typed as a subclass only reaches a
+      // method declared on its base class if those edges are visible.
+      // (Validated on dubbo: fanning out first downgraded exactly those
+      // supertype-method resolutions from the 0.9 typed-receiver path to the
+      // 0.65 word-overlap fallback.) They are the only edges resolution reads
+      // (RESOLUTION_READ_EDGE_KINDS), so a batch that made none — every batch
+      // after the prerequisite phase readNextBatch drains first — fans the
+      // next batch out now and inserts while it resolves: the same writes in
+      // the same order, and nothing the workers read differs.
       tLp = Date.now();
       const edges = this.createEdges(result.resolved);
       lp('createEdges', tLp);
+      const readEdge = edges.some((e) => RESOLUTION_READ_EDGE_KINDS.includes(e.kind));
+      let nextInFlight = !readEdge && nextBatch.length > 0 ? beginBatch(nextBatch) : null;
       tLp = Date.now();
       for (let i = 0; i < edges.length; i += PERSIST_CHUNK) {
         this.queries.insertEdges(edges.slice(i, i + PERSIST_CHUNK));
@@ -2067,11 +2082,12 @@ export class ReferenceResolver {
       }
       lp('insertEdges', tLp);
 
-      // NOW fan the next batch out — workers see exactly the edge state the
-      // sequential baseline would (every batch ≤ this one committed), while
-      // the main thread spends the REST of the persist (ref deletes + failed
-      // parking below) overlapped with their resolution — the double-buffer.
-      const nextInFlight = nextBatch.length > 0 ? beginBatch(nextBatch) : null;
+      // NOW fan the next batch out (if not already) — workers see exactly the
+      // edge state the sequential baseline would (every batch ≤ this one
+      // committed), while the main thread spends the REST of the persist (ref
+      // deletes + failed parking below) overlapped with their resolution —
+      // the double-buffer.
+      if (!nextInFlight && nextBatch.length > 0) nextInFlight = beginBatch(nextBatch);
 
       // Clean up resolved refs so they don't appear in the next batch —
       // by row id, so a same-key sibling ref in a LATER batch (same caller
