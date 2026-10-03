@@ -35,6 +35,7 @@ import { ExploreSessionState } from './explore-session-state';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import type { MCPEngine } from './engine';
+import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
 const DEFAULT_PPID_POLL_MS = 5000;
@@ -47,6 +48,15 @@ const DEFAULT_PPID_POLL_MS = 5000;
  */
 const DEFAULT_DAEMON_RETRY_MS = 5_000;
 const DEFAULT_DAEMON_RETRY_MAX_MS = 300_000;
+
+/**
+ * Longest the proxy waits, once it is shutting down, for its in-process engines
+ * to stop before exiting anyway. An engine's stop waits up to
+ * {@link WORKER_START_SETTLE_MS} for a query worker still starting up (exiting
+ * mid-start can crash the process on Windows); this bounds a stop that never
+ * settles (#2311).
+ */
+const SHUTDOWN_BACKSTOP_MS = WORKER_START_SETTLE_MS + 5_000;
 
 /**
  * Env var that opts INTO the "attached to shared daemon" log line. Off by
@@ -286,8 +296,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     try { daemonSocket?.destroy(); } catch { /* ignore */ }
     // Exit once every engine has stopped, a retiring one included: exiting while
     // a query worker is still starting up can crash the process on Windows (see
-    // QueryPool.destroy). The backstop bounds a stop that never settles.
-    setTimeout(() => process.exit(0), 20_000);
+    // QueryPool.destroy), and stopping releases the writer lock. The backstop
+    // bounds a stop that never settles; it stays ref'd so the process lives
+    // until one of the two exits it.
+    setTimeout(() => {
+      process.stderr.write(`[CodeGraph MCP] In-process engine did not stop within ${SHUTDOWN_BACKSTOP_MS}ms; exiting anyway.\n`);
+      process.exit(0);
+    }, SHUTDOWN_BACKSTOP_MS);
     const stopping = [engine, ...retiring].map((e) => Promise.resolve().then(() => e?.stop()));
     void Promise.allSettled(stopping).then(() => process.exit(0));
   };
@@ -365,6 +380,8 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let stdinBuf = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk: string) => {
+    // Nothing is served once shutdown starts: a call now could start an engine
+    // shutdown() never sees, and the process exits as soon as the others stop.
     if (shuttingDown) return;
     stdinBuf += chunk;
     let idx: number;
