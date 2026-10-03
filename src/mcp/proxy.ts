@@ -250,6 +250,8 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let engineReady: Promise<void> | null = null;
   // Calls being served in-process; the engine is only ever stopped after they finish.
   const localCalls = new Set<Promise<void>>();
+  // Engines retired but not yet stopped; shutdown() waits for them too.
+  const retiring = new Set<MCPEngine>();
   let shuttingDown = false;
   const retryBaseMs = parseDelayMs(process.env.CODEGRAPH_DAEMON_RETRY_MS, DEFAULT_DAEMON_RETRY_MS);
   const retryMaxMs = Math.max(retryBaseMs, parseDelayMs(process.env.CODEGRAPH_DAEMON_RETRY_MAX_MS, DEFAULT_DAEMON_RETRY_MAX_MS));
@@ -282,12 +284,18 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     try { livenessWatchdog?.stop(); } catch { /* ignore */ }
     if (retryTimer) clearTimeout(retryTimer);
     try { daemonSocket?.destroy(); } catch { /* ignore */ }
-    try { engine?.stop(); } catch { /* ignore */ }
-    process.exit(0);
+    // Exit once every engine has stopped, a retiring one included: exiting while
+    // a query worker is still starting up can crash the process on Windows (see
+    // QueryPool.destroy). The backstop bounds a stop that never settles.
+    setTimeout(() => process.exit(0), 20_000);
+    const stopping = [engine, ...retiring].map((e) => Promise.resolve().then(() => e?.stop()));
+    void Promise.allSettled(stopping).then(() => process.exit(0));
   };
   // Resolves the engine a call was started on, so a call in flight while the
   // engine is being retired still finishes on it.
   const ensureEngine = async (): Promise<MCPEngine> => {
+    // shutdown() stops only the engines it can see; never start one after it.
+    if (!engine && shuttingDown) throw new Error('codegraph is shutting down');
     if (!engine) {
       engine = deps.makeEngine();
       engineReady = engine.ensureInitialized(deps.root).catch(() => { /* degraded */ });
@@ -302,8 +310,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     const retired = engine;
     engine = null;
     engineReady = null;
-    await Promise.allSettled([...localCalls]);
-    try { await retired?.stop(); } catch { /* best-effort */ }
+    if (retired) retiring.add(retired);
+    try {
+      await Promise.allSettled([...localCalls]);
+      try { await retired?.stop(); } catch { /* best-effort */ }
+    } finally {
+      if (retired) retiring.delete(retired);
+    }
   };
   // Daemon-unavailable fallback: serve a client message in-process.
   const handleLocally = (line: string): Promise<void> => {
@@ -352,6 +365,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let stdinBuf = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk: string) => {
+    if (shuttingDown) return;
     stdinBuf += chunk;
     let idx: number;
     while ((idx = stdinBuf.indexOf('\n')) !== -1) {

@@ -213,6 +213,14 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * How much longer `stopDaemonAt` waits for a daemon that has closed its socket
+ * but not yet exited. Its shutdown waits up to 15 s for each query worker still
+ * starting up (WORKER_START_SETTLE_MS in query-pool.ts), so this covers that
+ * plus the rest of the shutdown.
+ */
+const DAEMON_SHUTDOWN_GRACE_MS = 17_000;
+
 async function waitForDeath(pid: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -287,9 +295,18 @@ export async function stopDaemonAt(root: string, options: { preserveUnverified?:
   let outcome: StopResult['outcome'] = 'term';
   if (!(await waitForDeath(pid, 3000))) {
     // Re-prove identity before escalating; the old PID may have been reused.
-    if (!sameLock() || !await probeDaemonIdentity(identity) || !sameLock()) {
-      return { root, pid, outcome: 'still-running' };
+    if (!sameLock()) return { root, pid, outcome: 'still-running' };
+    if (!await probeDaemonIdentity(identity)) {
+      // Socket closed, lock still held: the daemon is partway through its
+      // shutdown, which waits on query workers still starting up. Wait for
+      // it rather than report it still running; nothing is signalled here.
+      if (!sameLock() || !(await waitForDeath(pid, DAEMON_SHUTDOWN_GRACE_MS))) {
+        return { root, pid, outcome: 'still-running' };
+      }
+      cleanupDaemonArtifacts(root, lockContents);
+      return { root, pid, outcome: 'term' };
     }
+    if (!sameLock()) return { root, pid, outcome: 'still-running' };
     try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
     if (!(await waitForDeath(pid, 2000))) {
       return { root, pid, outcome: 'still-running' };

@@ -143,6 +143,48 @@ describe('daemon-registry', () => {
     }
   }, 15000);
 
+  it('waits for a daemon that has closed its socket but is still shutting down', async () => {
+    // A daemon's shutdown closes its socket first, then waits up to 15 s for
+    // query workers still starting up before it exits. Past the first 3 s the
+    // identity probe fails; that is a daemon still stopping, not a stranger.
+    const root = fs.mkdtempSync(path.join(tmpHome, 'stop-slow-'));
+    fs.mkdirSync(path.join(root, '.codegraph'));
+    const socketPath = getDaemonSocketPath(root);
+    const pid = startDetachedProcess();
+    const server = net.createServer((socket) => {
+      socket.end(`${JSON.stringify({ protocol: 1, codegraph: 'test', pid, socketPath })}\n`);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    fs.writeFileSync(
+      getDaemonPidPath(root),
+      encodeLockInfo({ pid, version: 'test', socketPath, startedAt: Date.now() }),
+    );
+    const originalKill = process.kill.bind(process);
+    let exitTimer: NodeJS.Timeout | undefined;
+    const kill = vi.spyOn(process, 'kill').mockImplementation((target, signal) => {
+      if (target === pid && signal === 'SIGTERM') {
+        server.close();
+        exitTimer = setTimeout(() => originalKill(pid, 'SIGKILL'), 4000);
+        return true;
+      }
+      return originalKill(target, signal);
+    });
+    try {
+      const result = await stopDaemonAt(root);
+      expect(result.outcome).toBe('term');
+      expect(isProcessAlive(pid)).toBe(false);
+      expect(kill.mock.calls.some(([target, signal]) => target === pid && signal === 'SIGKILL')).toBe(false);
+      expect(fs.existsSync(getDaemonPidPath(root))).toBe(false);
+    } finally {
+      clearTimeout(exitTimer);
+      kill.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000);
+
   it('preserves a newer lock installed during a successful stop identity probe', async () => {
     const root = fs.mkdtempSync(path.join(tmpHome, 'stop-race-'));
     fs.mkdirSync(path.join(root, '.codegraph'));
