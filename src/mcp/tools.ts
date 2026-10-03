@@ -34,6 +34,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
+import { isSemanticEdge } from '../graph/semantic-edges';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import {
@@ -3337,6 +3338,23 @@ export class ToolHandler {
     const m = edge.metadata as Record<string, unknown> | undefined;
     const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
     const at = registeredAt ? ` @${registeredAt}` : '';
+    if (m?.synthesizedBy === 'lua-rust-operation') {
+      const operation = typeof m.operation === 'string' ? ` \`${m.operation}\`` : '';
+      const via = typeof m.nativeSymbol === 'string' ? ` via \`${m.nativeSymbol}\`` : '';
+      return {
+        label: `LuaJIT → Rust operation${operation}${via} (source-derived dispatch)`,
+        compact: `dynamic: lua rust operation${operation}${via}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'lua-rust-ffi') {
+      const via = typeof m.nativeSymbol === 'string' ? ` via \`${m.nativeSymbol}\`` : '';
+      return {
+        label: `LuaJIT → Rust FFI${via} (static C-ABI symbol match)`,
+        compact: `dynamic: lua rust ffi${via}${at}`,
+        registeredAt,
+      };
+    }
     if (m?.synthesizedBy === 'callback') {
       const via = m.via ? `\`${String(m.via)}\`` : 'a registrar';
       const field = m.field ? ` on .${String(m.field)}` : '';
@@ -3486,7 +3504,7 @@ export class ToolHandler {
           const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
           for (const edge of incident) {
             if (synthLines.length >= 6) break;
-            if (edge.provenance !== 'heuristic') continue;
+            if (edge.provenance !== 'heuristic' || !isSemanticEdge(edge)) continue;
             const otherId = edge.source === n.id ? edge.target : edge.source;
             if (otherId === n.id) continue;
             const other = cg.getNode(otherId);

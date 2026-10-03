@@ -14,6 +14,7 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
+import { analyzeLua } from './lua-ffi-analysis';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -1533,6 +1534,46 @@ const LUA_GLOBAL_FUNCTIONS: ReadonlySet<string> = new Set([
   'describe', 'it', 'before_each', 'after_each', 'setup', 'teardown', 'lazy_setup', 'lazy_teardown', 'pending', 'finally',
   'insulate', 'expose',
 ]);
+
+const LUA_PARAMETER_CALLS = new WeakMap<ResolutionContext, Map<string, Map<string, { parameter: boolean; shadowsNamespace: boolean }>>>();
+
+/** Lexical parameter provenance prevents imports from replacing runtime values. */
+export function isLuaParameterCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'lua' || ref.referenceKind !== 'calls') return false;
+  const root = /^([A-Za-z_]\w*)(?:[.:]|$)/.exec(ref.referenceName)?.[1];
+  if (!root) return false;
+  const owner = context.getNodeById?.(ref.fromNodeId) ??
+    context.getNodesInFile(ref.filePath).find(n => n.id === ref.fromNodeId);
+  if (!owner || (owner.kind !== 'function' && owner.kind !== 'method')) return false;
+  // Table methods conventionally pass their own receiver explicitly with dot syntax.
+  if (owner.kind === 'method' && root === 'self') return false;
+  if (ref.language === 'lua') {
+    let files = LUA_PARAMETER_CALLS.get(context);
+    if (!files) LUA_PARAMETER_CALLS.set(context, files = new Map());
+    let calls = files.get(ref.filePath);
+    if (!calls) {
+      calls = new Map();
+      const source = context.readFile(ref.filePath);
+      if (source !== null) {
+        for (const call of analyzeLua(source).calls) {
+          calls.set(`${call.line}:${call.column}`, {
+            parameter: call.parameterReceiver === true || (call.parameterBinding === true &&
+              !call.importedModule && call.localFunctionStartIndex === undefined && !call.ffiSymbol),
+            shadowsNamespace: call.parameterShadowsNamespace === true,
+          });
+        }
+      }
+      files.set(ref.filePath, calls);
+    }
+    const parameter = calls.get(`${ref.line}:${ref.column}`);
+    // Preserve ordinary receiver-method inference; a shadowed namespace is a different value.
+    if (parameter !== undefined) return parameter.parameter &&
+      (!ref.referenceName.includes(':') || parameter.shadowsNamespace);
+  }
+  if (ref.referenceName.includes(':')) return false;
+  const params = /^\s*\(([^)]*)\)/.exec(owner.signature ?? '')?.[1];
+  return params !== undefined && params.split(',').some(p => p.trim().split(/\s*:\s*/)[0] === root);
+}
 
 /** `require "m"` (or a loader named for it — kong's `reload_module("spec.internal.misc")`), then any `.member`s. */
 const LUA_REQUIRE_ALIAS = /^(?:require|[A-Za-z_]\w*(?:[Rr]equire|_module|[Ii]mport))\s*\(?\s*(["'])([^"']+)\1\s*\)?((?:\s*\.\s*[A-Za-z_]\w*)*)\s*$/;
@@ -6661,6 +6702,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   ESM_EXPORT_LISTS.delete(context);
   LUA_LOCALS.delete(context);
   LUA_MEMBERS.delete(context);
+  LUA_PARAMETER_CALLS.delete(context);
   JVM_PACKAGES.delete(context);
   MINIFIED_SCRIPTS.delete(context);
   PY_LOCAL_BINDS.delete(context);
@@ -9582,6 +9624,7 @@ function matchReferenceInner(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (isLuaParameterCall(ref, context)) return null;
   // Function-as-value refs (#756) resolve ONLY through the dedicated matcher —
   // never the fuzzy/qualified fallthrough below (a wrong callback edge is
   // worse than none).

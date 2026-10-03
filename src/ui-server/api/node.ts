@@ -23,6 +23,7 @@
 import type { CodeGraph } from '../../index';
 import type { Edge, Node, NodeKind } from '../../types';
 import { isTestFile } from '../../search/query-utils';
+import { isSemanticEdge } from '../../graph/semantic-edges';
 import { buildHierarchy, type WireOverride } from './hierarchy';
 import { notFound } from './respond';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
@@ -84,8 +85,8 @@ export async function buildNode(cg: CodeGraph, projectRoot: string, nodeId: stri
     );
   }
 
-  const incomingAll = cg.getIncomingEdges(nodeId);
-  const outgoingAll = cg.getOutgoingEdges(nodeId);
+  const incomingAll = cg.getIncomingEdges(nodeId).filter(isSemanticEdge);
+  const outgoingAll = cg.getOutgoingEdges(nodeId).filter(isSemanticEdge);
 
   // `contains` is structure, not dependency: upward it is the parent (already in
   // `ancestors`), downward it is the members outline. Leaving it in the rails

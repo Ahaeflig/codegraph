@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- LuaJIT FFI calls can now connect to verified Rust exports and source-derived operation handlers, keeping separate operations distinct in callers and impact results.
 
 ## [1.6.2] - 2026-10-03
 

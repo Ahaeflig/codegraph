@@ -40,6 +40,7 @@ import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequest
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
+import { luaRustBridgeEdges } from './lua-rust-synthesizer';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -3776,6 +3777,10 @@ const ALWAYS = (): boolean => true;
 
 /** Conservative input gates for SYNTH_PASSES; keep these in sync when adding a pass. */
 export function hasSynthesisPattern(filePath: string, content: string): boolean {
+  // Any binding/call/handler edit can invalidate a source-derived FFI route,
+  // including an input that previously emitted no edge. Custom Lua extensions
+  // use the function token as a conservative input gate.
+  if (/\.(?:lua|luau|rs)$/.test(filePath) || (/\bfunction\b/.test(content) && /\bend\b/.test(content))) return true;
   // These passes consume declarations/layouts as well as dispatch sites. A
   // header or markup edit can change a channel whose endpoints live elsewhere.
   if (/\.(?:vue|svelte|dfm|fmx|nix|xml)$/.test(filePath)) return true;
@@ -3812,6 +3817,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
  * run because interfaceOverrideEdges reads their edges from the DB.
  */
 export const SYNTH_PASSES: SynthPassDef[] = [
+  { name: 'luaRustBridge', gate: (has) => has('lua') && has('rust'), run: (q, c, y) => luaRustBridgeEdges(q, c, y) },
   { name: 'fieldEdges', gate: ALWAYS, run: (q, c, y) => fieldChannelEdges(q, c, y) },
   { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
   // Cross-tier channels — a client's `fetch('/api/x')` onto its own route,

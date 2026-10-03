@@ -37,6 +37,7 @@ import type { Node, Edge } from '../types';
 import { isTestFile } from '../search/query-utils';
 
 import { lastQualifierPart, matchesSymbol } from './symbol-lookup';
+import { isSemanticEdge } from './semantic-edges';
 
 // Preserve the existing imports while sharing the matcher with the CLI and MCP.
 export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-lookup';
@@ -311,7 +312,7 @@ export function resolveNamedTokens(
   // callers, so ask the edges directly.
   const hasHeuristicEdge = (id: string): boolean =>
     [...cg.getIncomingEdges(id), ...cg.getOutgoingEdges(id)].some(
-      (e) => e.provenance === 'heuristic'
+      (e) => e.provenance === 'heuristic' && isSemanticEdge(e)
     );
 
   for (const t of tokens) {
@@ -417,7 +418,7 @@ function walkCalls(
     if (id !== seed.id && named.has(id)) reached.push(id);
     if (depth >= maxHops - 1) continue;
     for (const c of cg.getCallees(id)) {
-      if (!FLOW_EDGE_KINDS.has(c.edge.kind) || parent.has(c.node.id)) continue;
+      if (!isSemanticEdge(c.edge) || !FLOW_EDGE_KINDS.has(c.edge.kind) || parent.has(c.node.id)) continue;
       // A route node is a connector, not a symbol the reader would have named:
       // crossing one costs no bridge budget.
       const newStreak = named.has(c.node.id) ? 0 : c.node.kind === 'route' ? streak : streak + 1;
@@ -491,7 +492,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontF) {
         for (const c of cg.getCallees(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || forward.has(c.node.id)) continue;
+          if (!isSemanticEdge(c.edge) || !FLOW_EDGE_KINDS.has(c.edge.kind) || forward.has(c.node.id)) continue;
           forward.set(c.node.id, { prev: node.id, edge: c.edge, node: c.node });
           next.push(c.node);
         }
@@ -503,7 +504,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontB) {
         for (const c of cg.getCallers(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || backward.has(c.node.id)) continue;
+          if (!isSemanticEdge(c.edge) || !FLOW_EDGE_KINDS.has(c.edge.kind) || backward.has(c.node.id)) continue;
           backward.set(c.node.id, { next: node.id, edge: c.edge });
           backNodes.set(c.node.id, c.node);
           next.push(c.node);

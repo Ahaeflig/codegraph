@@ -520,6 +520,52 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 
 4. **Auto-Sync** — The MCP server watches your project using native OS file events. Changes are debounced (2-second quiet window), filtered to source files only, and incrementally synced. The graph stays fresh as you code — no configuration needed.
 
+### LuaJIT FFI and Rust operation dispatch
+
+LuaJIT calls through a verified `require("ffi")` binding, `ffi.C`, or
+`ffi.load(...)` can link by exact symbol name to unique indexed Rust C-ABI exports. This is
+a static symbol match, not verification of which binary a runtime loader opens. The source
+must declare the C ABI (`extern "C"` or bare `extern`) plus `no_mangle` or `export_name` (including Rust 2024
+`unsafe(...)` attributes). Aliases, `pcall(ffi.load, ...)`, and conservative
+lazy-loader assignments are supported; spelling a receiver `ffi` is not proof.
+
+For a string-operation protocol, CodeGraph follows Lua parameter-forwarding
+wrappers and Rust parameter forwarding into literal `match` dispatch arms.
+Static operation names link directly to their corresponding Rust handler;
+function-valued arms require evidence that the selected function is invoked.
+Required Lua modules must actually export the invoked member. Cross-crate Rust
+bindings require declared module paths and local Cargo path dependencies
+(including workspace-inherited dependencies). Supported declarative macros and
+callback wrappers are followed only when their source proves expression or
+callback invocation.
+There are no built-in project names, operation names, or manual routing tables.
+Ordinary wrapper sidecalls remain in the graph.
+
+Local module getters with a single unconditional return of a literal `require`,
+a proven namespace alias, or another proven local getter are supported inside
+functions. Library getters can return a captured library alias or `ffi.C`.
+Rebinding or mutating a captured namespace invalidates that proof. Global and
+method getters, branching getters, unknown factories, and getters that directly
+return `ffi.load(...)` remain unresolved.
+
+The generic native transport edge is retained as a raw reference with
+`transportOnly: true`; semantic callers, callees, paths, and impact traversal
+exclude that edge to avoid making every operation reach every handler. The
+operation-specific edge records the native export and Rust dispatch source as
+provenance. Inspect raw edges/usages for transport dependencies: semantic impact
+is not a complete ABI-change dependency report.
+
+This is conservative static analysis, not runtime execution. Computed symbols,
+unknown operation values, ambiguous native exports/types, unsupported value
+transforms, and unverified macro expansion remain unresolved. Both sides must
+be indexed. Source-only edits invalidate the bridge during incremental sync.
+Re-index an existing project after upgrading to obtain the new bridge edges,
+and after editing Cargo manifests. Runtime loading, conditional compilation,
+custom module paths, procedural macros, and external crates are not evaluated.
+
+See the [validation record](docs/design/lua-rust-bridge-validation.md) for real
+repository coverage, indexing cost, and the pending agent benchmark.
+
 ---
 
 ## CLI Reference
