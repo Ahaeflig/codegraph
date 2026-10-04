@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, isLuaParameterCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
+import { isPythonSelfCall, isLuaParameterCall, hasLuaRustBridge, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -1678,7 +1678,8 @@ export class ReferenceResolver {
     maybeYield: MaybeYield
   ): Promise<ResolutionResult> {
     // Native extraction and parse workers do not load grammars in this isolate.
-    if (batch.some(ref => (ref.language || this.getLanguageFromNodeId(ref.fromNodeId)) === 'lua')) {
+    if (hasLuaRustBridge(this.context) &&
+      batch.some(ref => (ref.language || this.getLanguageFromNodeId(ref.fromNodeId)) === 'lua')) {
       await loadGrammarsForLanguages(['lua']);
     }
     this.warmCaches();

@@ -28,6 +28,7 @@ import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
 import { collectBeforeExit } from '../worker-teardown';
 import { loadGrammarsForLanguages } from '../extraction/grammars';
+import { hasLuaRustBridge } from './name-matcher';
 import type { UnresolvedReference } from '../types';
 
 if (!parentPort) {
@@ -91,7 +92,9 @@ port.on('message', (msg: InMessage) => {
         void (async () => {
           const tRes = Date.now();
           try {
-            if (msg.refs.some(ref => (ref.language ?? r.getResolutionContext().getNodeById?.(ref.fromNodeId)?.language) === 'lua')) {
+            const context = r.getResolutionContext();
+            if (hasLuaRustBridge(context) &&
+              msg.refs.some(ref => (ref.language ?? context.getNodeById?.(ref.fromNodeId)?.language) === 'lua')) {
               await loadGrammarsForLanguages(['lua']);
             }
             const out = r.resolveListForAdmission(msg.refs);

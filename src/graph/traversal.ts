@@ -2,13 +2,12 @@
  * Graph Traversal Algorithms
  *
  * BFS and DFS traversal for the code knowledge graph.
- * Semantic traversals omit explicitly marked transport-only evidence; raw
- * edge queries and findUsages retain it for ABI/transport inspection.
+ * Every walk treats a transport edge as a boundary (transport-edges.ts).
  */
 
 import { Node, Edge, Subgraph, TraversalOptions, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
-import { isSemanticEdge } from './semantic-edges';
+import { isTransportEdge } from './transport-edges';
 
 /**
  * Default traversal options
@@ -111,6 +110,11 @@ export class GraphTraverser {
 
       for (const adjEdge of adjacentEdges) {
         const nextNodeId = adjEdge.source === node.id ? adjEdge.target : adjEdge.source;
+        // A backward walk crosses transport only at its start; any other walk
+        // keeps the far end of a transport edge unexpanded.
+        const transport = isTransportEdge(adjEdge);
+        if (transport && opts.direction === 'incoming' && depth > 0) continue;
+        const ends = transport && opts.direction !== 'incoming';
         const nextNode = neighborNodes.get(nextNodeId) ?? nodes.get(nextNodeId);
         if (!nextNode) continue;
 
@@ -121,11 +125,15 @@ export class GraphTraverser {
         // Enqueue each neighbor exactly once, and only while under the node
         // budget — the cap is checked per-add here, not just on the outer
         // `while`, so one high-degree node can't overshoot `opts.limit` (#1087).
+        // An unexpanded far end is kept but not queued, so a walk that reaches
+        // it another way still expands it.
         if (!visited.has(nextNodeId) && !enqueued.has(nextNodeId)) {
-          if (nodes.size >= opts.limit) continue;
-          enqueued.add(nextNodeId);
+          if (!nodes.has(nextNodeId) && nodes.size >= opts.limit) continue;
           nodes.set(nextNode.id, nextNode);
-          queue.push({ node: nextNode, edge: adjEdge, depth: depth + 1 });
+          if (!ends) {
+            enqueued.add(nextNodeId);
+            queue.push({ node: nextNode, edge: adjEdge, depth: depth + 1 });
+          }
         }
 
         // Record every distinct edge among kept nodes. Collecting on the
@@ -215,6 +223,10 @@ export class GraphTraverser {
       const nextNodeId = edge.source === node.id ? edge.target : edge.source;
       if (visited.has(nextNodeId)) continue;
 
+      // A backward walk crosses transport only at its start (see traverseBFS).
+      const transport = isTransportEdge(edge);
+      if (transport && opts.direction === 'incoming' && depth > 0) continue;
+
       const nextNode = neighborNodes.get(nextNodeId);
       if (!nextNode) continue;
 
@@ -227,7 +239,8 @@ export class GraphTraverser {
       nodes.set(nextNode.id, nextNode);
       edges.push(edge);
 
-      // Recurse
+      // Recurse, except past the far end of a forward or undirected transport hop
+      if (transport && opts.direction !== 'incoming') continue;
       this.dfsRecursive(nextNode, depth + 1, opts, nodes, edges, visited);
     }
   }
@@ -243,14 +256,14 @@ export class GraphTraverser {
     const kinds = edgeKinds && edgeKinds.length > 0 ? edgeKinds : undefined;
 
     if (direction === 'outgoing') {
-      return this.queries.getOutgoingEdges(nodeId, kinds).filter(isSemanticEdge);
+      return this.queries.getOutgoingEdges(nodeId, kinds);
     } else if (direction === 'incoming') {
-      return this.queries.getIncomingEdges(nodeId, kinds).filter(isSemanticEdge);
+      return this.queries.getIncomingEdges(nodeId, kinds);
     } else {
       // Both directions
       const outgoing = this.queries.getOutgoingEdges(nodeId, kinds);
       const incoming = this.queries.getIncomingEdges(nodeId, kinds);
-      return [...outgoing, ...incoming].filter(isSemanticEdge);
+      return [...outgoing, ...incoming];
     }
   }
 
@@ -311,7 +324,9 @@ export class GraphTraverser {
     // caller of the class. Without it, `callers <Class>` surfaced only the
     // importing file (via `imports`) and missed every construction site —
     // the opposite of "what breaks if I change this class?" (#774).
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']).filter(isSemanticEdge);
+    // Transport callers belong to the entry itself, not to the code behind it.
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates'])
+      .filter((e) => currentDepth === 0 || !isTransportEdge(e));
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one
@@ -366,7 +381,7 @@ export class GraphTraverser {
     // (`Foo(...)` / `new Foo()`) has that class as a callee, so callers and
     // callees stay inverses of each other and `trace` can cross the
     // instantiation boundary (function → class → its methods) (#774).
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']).filter(isSemanticEdge);
+    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']);
     if (outgoingEdges.length === 0) return;
 
     // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).
@@ -380,6 +395,8 @@ export class GraphTraverser {
         reported.add(calleeNode.id);
         result.push({ node: calleeNode, edge });
       }
+      // A transport hop ends the path at its entry.
+      if (isTransportEdge(edge)) continue;
       this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited, reported);
     }
   }
@@ -532,9 +549,7 @@ export class GraphTraverser {
   /**
    * Calculate the impact radius of a node
    *
-   * Returns semantic dependents that could be affected by changes to this node.
-   * Transport-only evidence is excluded to avoid joining unrelated operations
-   * through a shared dispatcher; inspect raw incoming edges for ABI usages.
+   * Returns all nodes that could be affected by changes to this node.
    *
    * @param nodeId - ID of the node
    * @param maxDepth - Maximum depth to traverse (default: 3)
@@ -613,7 +628,9 @@ export class GraphTraverser {
     // `contains`: a container "contains" its members but does not *depend* on
     // them, so following it upward would climb to the parent class and then
     // re-expand every sibling member — exploding impact for a leaf symbol. (#536)
-    const incomingEdges = this.queries.getIncomingEdges(nodeId).filter((e) => e.kind !== 'contains' && isSemanticEdge(e));
+    // Transport dependents belong to the entry itself (see getCallersRecursive).
+    const incomingEdges = this.queries.getIncomingEdges(nodeId)
+      .filter((e) => e.kind !== 'contains' && (currentDepth === 0 || !isTransportEdge(e)));
     if (incomingEdges.length === 0) return;
     const sources = this.queries.getNodesByIds(incomingEdges.map((e) => e.source));
 
@@ -638,7 +655,7 @@ export class GraphTraverser {
    *
    * @param fromId - Starting node ID
    * @param toId - Target node ID
-   * @param edgeKinds - Edge types to consider (all semantic edges if empty)
+   * @param edgeKinds - Edge types to consider (all if empty)
    * @returns Array of nodes and edges forming the path, or null if no path exists
    */
   findPath(
@@ -676,7 +693,7 @@ export class GraphTraverser {
       const outgoingEdges = this.queries.getOutgoingEdges(
         nodeId,
         edgeKinds.length > 0 ? edgeKinds : undefined
-      ).filter(isSemanticEdge);
+      );
       if (outgoingEdges.length === 0) continue;
 
       // Batch-fetch only targets not yet visited or queued.
@@ -686,6 +703,11 @@ export class GraphTraverser {
       const nextNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
 
       for (const edge of outgoingEdges) {
+        // A transport hop ends a path at its entry and continues none.
+        if (isTransportEdge(edge)) {
+          if (edge.target === toId) return [...path, { node: toNode, edge }];
+          continue;
+        }
         if (!visited.has(edge.target) && !enqueued.has(edge.target)) {
           const nextNode = nextNodes.get(edge.target);
           if (nextNode) {

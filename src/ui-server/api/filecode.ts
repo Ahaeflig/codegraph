@@ -33,7 +33,6 @@
 import type { CodeGraph } from '../../index';
 import type { Edge, Node } from '../../types';
 import { isTestFile } from '../../search/query-utils';
-import { isSemanticEdge } from '../../graph/semantic-edges';
 import { buildOutlineEntries, type WireOutlineEntry } from './file';
 import { readFileShape, resolveRequestedFile } from './source';
 import { badRequest } from './respond';
@@ -210,7 +209,7 @@ function buildCalls(
   const nodeIds = nodes.map((n) => n.id);
   const lineOf = new Map(nodes.map((n) => [n.id, n.startLine] as const));
 
-  const edges = cg.getOutgoingEdgesFrom(nodeIds).filter((e) => e.kind !== 'contains' && isSemanticEdge(e));
+  const edges = cg.getOutgoingEdgesFrom(nodeIds).filter((e) => e.kind !== 'contains');
   if (edges.length === 0) return { calls: [], total: 0, intraFileCalls: 0 };
 
   const bySource = new Map<string, Edge[]>();

@@ -14,7 +14,8 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
-import { analyzeLua } from './lua-ffi-analysis';
+import type { LuaCall } from './lua-ffi-analysis';
+import { cachedLuaAnalysis } from './bridge-analysis-cache';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -1535,11 +1536,31 @@ const LUA_GLOBAL_FUNCTIONS: ReadonlySet<string> = new Set([
   'insulate', 'expose',
 ]);
 
-const LUA_PARAMETER_CALLS = new WeakMap<ResolutionContext, Map<string, Map<string, { parameter: boolean; shadowsNamespace: boolean }>>>();
+const LUA_PARAMETER_CALLS = new WeakMap<ResolutionContext, Map<string, Map<string, LuaCall[]>>>();
+const LUA_RUST_PROJECTS = new WeakMap<ResolutionContext, boolean>();
+
+/**
+ * The parameter rule keeps Lua wrappers precise for the Lua/Rust bridge, so it
+ * applies only where that bridge runs. Its resolvers load the Lua grammar first.
+ */
+export function hasLuaRustBridge(context: ResolutionContext): boolean {
+  let bridge = LUA_RUST_PROJECTS.get(context);
+  if (bridge === undefined) {
+    let lua = false;
+    let rust = false;
+    for (const file of context.iterateNodesByKind?.('file') ?? context.getNodesByKind('file')) {
+      lua ||= file.language === 'lua';
+      rust ||= file.language === 'rust';
+      if (lua && rust) break;
+    }
+    LUA_RUST_PROJECTS.set(context, bridge = lua && rust);
+  }
+  return bridge;
+}
 
 /** Lexical parameter provenance prevents imports from replacing runtime values. */
 export function isLuaParameterCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (ref.language !== 'lua' || ref.referenceKind !== 'calls') return false;
+  if (ref.language !== 'lua' || ref.referenceKind !== 'calls' || !hasLuaRustBridge(context)) return false;
   const root = /^([A-Za-z_]\w*)(?:[.:]|$)/.exec(ref.referenceName)?.[1];
   if (!root) return false;
   const owner = context.getNodeById?.(ref.fromNodeId) ??
@@ -1547,29 +1568,31 @@ export function isLuaParameterCall(ref: UnresolvedRef, context: ResolutionContex
   if (!owner || (owner.kind !== 'function' && owner.kind !== 'method')) return false;
   // Table methods conventionally pass their own receiver explicitly with dot syntax.
   if (owner.kind === 'method' && root === 'self') return false;
-  if (ref.language === 'lua') {
-    let files = LUA_PARAMETER_CALLS.get(context);
-    if (!files) LUA_PARAMETER_CALLS.set(context, files = new Map());
-    let calls = files.get(ref.filePath);
-    if (!calls) {
-      calls = new Map();
-      const source = context.readFile(ref.filePath);
-      if (source !== null) {
-        for (const call of analyzeLua(source).calls) {
-          calls.set(`${call.line}:${call.column}`, {
-            parameter: call.parameterReceiver === true || (call.parameterBinding === true &&
-              !call.importedModule && call.localFunctionStartIndex === undefined && !call.ffiSymbol),
-            shadowsNamespace: call.parameterShadowsNamespace === true,
-          });
-        }
-      }
-      files.set(ref.filePath, calls);
+  let files = LUA_PARAMETER_CALLS.get(context);
+  if (!files) LUA_PARAMETER_CALLS.set(context, files = new Map());
+  let calls = files.get(ref.filePath);
+  if (!calls) {
+    calls = new Map();
+    const source = context.readFile(ref.filePath);
+    const analysis = source === null ? null : cachedLuaAnalysis(context, ref.filePath, source);
+    for (const call of analysis?.calls ?? []) {
+      const key = `${call.line}:${call.column}`;
+      calls.set(key, [...(calls.get(key) ?? []), call]);
     }
-    const parameter = calls.get(`${ref.line}:${ref.column}`);
-    // Preserve ordinary receiver-method inference; a shadowed namespace is a different value.
-    if (parameter !== undefined) return parameter.parameter &&
-      (!ref.referenceName.includes(':') || parameter.shadowsNamespace);
+    // A partial analysis is no evidence yet; do not remember its absence.
+    if (!analysis?.partial) files.set(ref.filePath, calls);
   }
+  // A call and the call it is made from can share a position (`a.b(x)(y)`).
+  const candidates = calls.get(`${ref.line}:${ref.column}`) ?? [];
+  const matching = candidates.length > 1 ? candidates.filter(call => call.callee === ref.referenceName) : candidates;
+  if (matching.length === 1) {
+    const call = matching[0]!;
+    const parameter = call.parameterReceiver === true || (call.parameterBinding === true &&
+      !call.importedModule && call.localFunctionStartIndex === undefined && !call.ffiSymbol);
+    // Preserve ordinary receiver-method inference; a shadowed namespace is a different value.
+    return parameter && (!ref.referenceName.includes(':') || call.parameterShadowsNamespace === true);
+  }
+  if (candidates.length) return false;
   if (ref.referenceName.includes(':')) return false;
   const params = /^\s*\(([^)]*)\)/.exec(owner.signature ?? '')?.[1];
   return params !== undefined && params.split(',').some(p => p.trim().split(/\s*:\s*/)[0] === root);
@@ -6703,6 +6726,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   LUA_LOCALS.delete(context);
   LUA_MEMBERS.delete(context);
   LUA_PARAMETER_CALLS.delete(context);
+  LUA_RUST_PROJECTS.delete(context);
   JVM_PACKAGES.delete(context);
   MINIFIED_SCRIPTS.delete(context);
   PY_LOCAL_BINDS.delete(context);

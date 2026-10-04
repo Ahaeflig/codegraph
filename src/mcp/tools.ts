@@ -34,7 +34,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isSemanticEdge } from '../graph/semantic-edges';
+import { isTransportEdge } from '../graph/transport-edges';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import {
@@ -3339,7 +3339,8 @@ export class ToolHandler {
     const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
     const at = registeredAt ? ` @${registeredAt}` : '';
     if (m?.synthesizedBy === 'lua-rust-operation') {
-      const operation = typeof m.operation === 'string' ? ` \`${m.operation}\`` : '';
+      const names = Array.isArray(m.operations) ? m.operations.map(String) : typeof m.operation === 'string' ? [m.operation] : [];
+      const operation = names.length ? ` ${names.map(name => `\`${name}\``).join(', ')}` : '';
       const via = typeof m.nativeSymbol === 'string' ? ` via \`${m.nativeSymbol}\`` : '';
       return {
         label: `LuaJIT → Rust operation${operation}${via} (source-derived dispatch)`,
@@ -3349,9 +3350,23 @@ export class ToolHandler {
     }
     if (m?.synthesizedBy === 'lua-rust-ffi') {
       const via = typeof m.nativeSymbol === 'string' ? ` via \`${m.nativeSymbol}\`` : '';
+      if (m.transportOnly === true) {
+        return {
+          label: `LuaJIT → Rust FFI transport${via} (carries every operation; operation edges name each handler)`,
+          compact: `transport: lua rust ffi${via}, every operation${at}`,
+          registeredAt,
+        };
+      }
       return {
         label: `LuaJIT → Rust FFI${via} (static C-ABI symbol match)`,
         compact: `dynamic: lua rust ffi${via}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'lua-module-member') {
+      return {
+        label: 'Lua module member through a proven local getter (static resolution)',
+        compact: `static: lua module member${at}`,
         registeredAt,
       };
     }
@@ -3504,7 +3519,7 @@ export class ToolHandler {
           const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
           for (const edge of incident) {
             if (synthLines.length >= 6) break;
-            if (edge.provenance !== 'heuristic' || !isSemanticEdge(edge)) continue;
+            if (edge.provenance !== 'heuristic') continue;
             const otherId = edge.source === n.id ? edge.target : edge.source;
             if (otherId === n.id) continue;
             const other = cg.getNode(otherId);
@@ -8481,6 +8496,7 @@ export class ToolHandler {
    * callback is WIRED, not where it's invoked.
    */
   private edgeLabel(edge: Edge): string | null {
+    if (isTransportEdge(edge)) return this.synthEdgeNote(edge)?.compact ?? 'transport';
     if (edge.kind === 'calls') return null;
     if (edge.metadata?.fnRef === true) return 'callback registration';
     if (edge.kind === 'instantiates') return 'instantiation';

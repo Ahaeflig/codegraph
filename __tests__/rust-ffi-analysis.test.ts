@@ -71,10 +71,12 @@ describe('Rust FFI source proof', () => {
     const resolved = await routes(methods.replace('"task.read" => Engine::read', '"task.read" => Engine::missing') + exported);
     expect(resolved.map(r => r.operation)).toEqual(['task.run']);
   });
-  it('refuses ambiguous definitions and conflicting or guarded operation arms', async () => {
+  it('refuses ambiguous definitions and guarded operation arms; the first literal arm wins', async () => {
     expect(await routes(methods + 'impl Engine { fn run(&self) {} }' + exported)).toHaveLength(1);
-    const conflict = methods.replace('"task.read" => Engine::read', '"task.run" => Engine::read');
-    expect(await routes(conflict + exported)).toEqual([]);
+    const duplicate = methods.replace('"task.read" => Engine::read', '"task.run" => Engine::read');
+    expect((await routes(duplicate + exported)).map(r => `${r.operation}->${r.target.name}`)).toEqual(['task.run->run']);
+    const compiledOut = methods.replace('"task.run" => Engine::run', '#[cfg(feature = "x")] "task.run" => Engine::run, "task.run" => Engine::read');
+    expect((await routes(compiledOut + exported)).map(r => r.operation)).toEqual(['task.read']);
     const guarded = methods.replace('"task.run" => Engine::run', '"task.run" if enabled => Engine::run');
     expect((await routes(guarded + exported)).map(r => r.operation)).toEqual(['task.read']);
   });

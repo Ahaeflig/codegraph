@@ -70,6 +70,8 @@ function rebound(Bridge)
   return Bridge.call("task.run")
 end`;
     fs.writeFileSync(path.join(dir, 'caller.lua'), source);
+    // The parameter rule serves the Lua/Rust bridge, so only such projects use it.
+    fs.writeFileSync(path.join(dir, 'lib.rs'), 'pub fn native() {}\n');
     cg = await CodeGraph.init(dir, { silent: true });
     await cg.indexAll();
     const node = (name: string) => cg!.getNodesByName(name).find(node => node.kind === 'function' || node.kind === 'method')!;

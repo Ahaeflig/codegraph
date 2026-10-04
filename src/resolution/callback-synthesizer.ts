@@ -3775,12 +3775,18 @@ export interface SynthPassDef {
 
 const ALWAYS = (): boolean => true;
 
+/**
+ * Every Lua and Rust file feeds the Lua/Rust bridge, including one that has
+ * produced no edge yet: any binding, call or handler edit can change a route.
+ * The bridge runs only when the project holds both languages.
+ */
+export function isLuaRustBridgeInput(language: string | undefined, projectLanguages: ReadonlySet<string>): boolean {
+  if (language !== 'lua' && language !== 'rust') return false;
+  return (language === 'lua' || projectLanguages.has('lua')) && (language === 'rust' || projectLanguages.has('rust'));
+}
+
 /** Conservative input gates for SYNTH_PASSES; keep these in sync when adding a pass. */
 export function hasSynthesisPattern(filePath: string, content: string): boolean {
-  // Any binding/call/handler edit can invalidate a source-derived FFI route,
-  // including an input that previously emitted no edge. Custom Lua extensions
-  // use the function token as a conservative input gate.
-  if (/\.(?:lua|luau|rs)$/.test(filePath) || (/\bfunction\b/.test(content) && /\bend\b/.test(content))) return true;
   // These passes consume declarations/layouts as well as dispatch sites. A
   // header or markup edit can change a channel whose endpoints live elsewhere.
   if (/\.(?:vue|svelte|dfm|fmx|nix|xml)$/.test(filePath)) return true;
@@ -3906,7 +3912,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
  * order after these. A wrong hint costs wall time, never edges.
  */
 const SYNTH_PASS_COST_HINT: Readonly<Record<string, number>> = {
-  cFnPtrEdges: 100, registryEdges: 60, tierEdges: 55, jsxEdges: 25, rnEventEdgesList: 24,
+  cFnPtrEdges: 100, registryEdges: 60, tierEdges: 55, luaRustBridge: 40, jsxEdges: 25, rnEventEdgesList: 24,
   ifaceEdges: 18, flutterEdges: 16, cppEdges: 15, emitterEdges: 12, fieldEdges: 11,
   mybatisEdges: 10, vuexEdges: 8, closureCollEdges: 6, piniaEdges: 5, renderEdges: 4,
 };
@@ -4067,8 +4073,15 @@ export async function synthesizeCallbackEdges(
   // depends only on the files, so with a pool the main thread reads them while
   // the workers run the passes instead of after.
   const collectInputs = async (): Promise<string[]> => {
+    const bridgeInputs = new Set<string>();
+    if (has('lua') && has('rust')) {
+      for (const file of ctx.iterateNodesByKind?.('file') ?? ctx.getNodesByKind('file')) {
+        if (isLuaRustBridgeInput(file.language, langs)) bridgeInputs.add(file.filePath);
+      }
+    }
     const found: string[] = [];
     for (const file of ctx.getAllFiles()) {
+      if (bridgeInputs.has(file)) { found.push(file); continue; }
       const content = ctx.readFile(file);
       if (content !== null && hasSynthesisPattern(file, content)) found.push(file);
       await yieldToLoop();

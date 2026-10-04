@@ -228,8 +228,11 @@ local One={}; local Two={}; function One.call() lib.wire_send("one") end; functi
   expect(calls).toHaveLength(2);
   for (const call of calls) {
    const targets = cg!.getCallees(call.id).filter(edge => edge.node.language === 'rust');
-   expect(targets).toHaveLength(1);
-   expect(targets[0]!.node.qualifiedName).toContain(call.qualifiedName.includes('One') ? 'One' : 'Two');
+   // The export appears as transport; the operation edge names the handler.
+   expect(targets.filter(edge => edge.edge.metadata?.transportOnly).map(edge => edge.node.name)).toEqual(['wire_send']);
+   const handlers = targets.filter(edge => !edge.edge.metadata?.transportOnly);
+   expect(handlers).toHaveLength(1);
+   expect(handlers[0]!.node.qualifiedName).toContain(call.qualifiedName.includes('One') ? 'One' : 'Two');
   }
  });
 
@@ -249,4 +252,40 @@ function read_task() return core().call("task.read", "{}") end
   expect(callees('read_task')).toContain('cleanup');
  });
 
+ it('links a Lua file whose first FFI call arrives in an incremental edit', async () => {
+  await index({ 'native.rs': '#[no_mangle]\npub extern "C" fn native_ping() {}', 'caller.lua': 'function ping() return 1 end' });
+  expect(callees('ping')).not.toContain('native_ping');
+  write('caller.lua', 'local ffi = require("ffi")\nlocal lib = ffi.load("native")\nfunction ping() lib.native_ping() end');
+  await cg!.sync({ paths: ['caller.lua'] });
+  expect(callees('ping')).toContain('native_ping');
+ });
+
+ it('follows cdef asm labels to the linked symbol and refuses conflicting declarations', async () => {
+  const exports = ['ping', 'native_real', 'left_real', 'right_real']
+   .map(name => `#[no_mangle]\npub extern "C" fn ${name}() {}`).join('\n');
+  await index({ 'native.rs': exports,
+   'caller.lua': 'local ffi = require("ffi")\nffi.cdef[[ void ping(void) asm("native_real"); ]]\nfunction renamed() ffi.C.ping() end',
+   // One LuaJIT state shares cdef declarations, so two labels for one name link neither.
+   'left.lua': 'local ffi = require("ffi")\nffi.cdef[[ void twin(void) asm("left_real"); ]]\nfunction left() ffi.C.twin() end',
+   'right.lua': 'local ffi = require("ffi")\nffi.cdef[[ void twin(void) asm("right_real"); ]]\nfunction right() ffi.C.twin() end' });
+  expect(callees('renamed')).toContain('native_real');
+  expect(callees('renamed')).not.toContain('ping');
+  for (const caller of ['left', 'right']) {
+   expect(callees(caller)).not.toContain('left_real');
+   expect(callees(caller)).not.toContain('right_real');
+  }
+ });
+
+ it('keeps every operation that reaches one handler on its single edge', async () => {
+  await index({ 'native.rs': RUST.replace('"task.read" => Engine::read,', '"task.read" => Engine::read,\n   "task.again" => Engine::run,'),
+   'bridge.lua': LUA, 'caller.lua': `
+local Bridge = require("bridge")
+function twice() Bridge.call("task.run", "{}"); Bridge.call("task.again", "{}") end
+` });
+  const twice = node('twice');
+  const edges = cg!.getIncomingEdges(node('run', 'rust').id)
+   .filter(edge => edge.source === twice.id && edge.metadata?.synthesizedBy === 'lua-rust-operation');
+  expect(edges).toHaveLength(1);
+  expect(edges[0]!.metadata).toMatchObject({ operation: 'task.again', operations: ['task.again', 'task.run'] });
+ });
 });

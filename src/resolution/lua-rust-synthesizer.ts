@@ -13,9 +13,10 @@ import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
 import { loadGrammarsForLanguages } from '../extraction/grammars';
 import { createRustBridgeIdentity } from './rust-bridge-identity';
-import { analyzeLua, type LuaAnalysis, type LuaCall } from './lua-ffi-analysis';
+import type { LuaAnalysis, LuaCall } from './lua-ffi-analysis';
+import { cachedLuaAnalysis, cachedRustAnalysis, pruneStoredAnalyses } from './bridge-analysis-cache';
 import {
-  analyzeRustFfiFile, resolveRustFfiDispatch, findRustDispatchingExports,
+  resolveRustFfiDispatch, findRustDispatchingExports,
   type RustFunctionSummary, type RustFfiExport, type RustFfiDispatchRoute,
 } from './rust-ffi-analysis';
 
@@ -30,8 +31,9 @@ function rustNode(ctx: ResolutionContext, fn: RustFunctionSummary): Node | undef
 }
 
 export async function luaRustBridgeEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
-  // One bounded source read and AST per relevant file. No AST survives a file.
+  // One bounded source read per relevant file; an unchanged file reuses its stored analysis.
   await loadGrammarsForLanguages(['lua', 'rust']);
+  const live = new Set<string>();
   const rustFiles = [];
   const sites: Site[] = [];
   const luaFiles = new Map<string, { analysis: LuaAnalysis; symbols: Map<number, Node> }>();
@@ -41,9 +43,9 @@ export async function luaRustBridgeEdges(queries: QueryBuilder, ctx: ResolutionC
     if (language !== 'lua' && language !== 'rust') continue;
     const source = ctx.readFile(file);
     if (source === null) continue;
-    if (language === 'rust') rustFiles.push(await analyzeRustFfiFile(file, source));
+    if (language === 'rust') rustFiles.push(await cachedRustAnalysis(ctx, file, source, live));
     else {
-      const analysis = analyzeLua(source);
+      const analysis = cachedLuaAnalysis(ctx, file, source, live);
       const nodes = ctx.getNodesInFile(file);
       const symbols = new Map<number, Node>();
       const byPosition = new Map(nodes.filter(callable).map(n => [`${n.startLine}:${n.startColumn}:${n.name}`, n]));
@@ -59,7 +61,21 @@ export async function luaRustBridgeEdges(queries: QueryBuilder, ctx: ResolutionC
     }
     await onYield();
   }
+  pruneStoredAnalyses(ctx, live);
   const functions = new Map(rustFiles.flatMap(f => f.functions).map(f => [f.id, f]));
+  // cdef declarations are global to a LuaJIT state; an asm label renames the linked symbol.
+  const declared = new Map<string, Set<string>>();
+  for (const { analysis } of luaFiles.values()) {
+    for (const [name, symbols] of Object.entries(analysis.cdefSymbols)) {
+      const all = declared.get(name) ?? new Set<string>();
+      symbols.forEach(symbol => all.add(symbol));
+      declared.set(name, all);
+    }
+  }
+  const linkedSymbol = (name: string): string | undefined => {
+    const symbols = declared.get(name);
+    return !symbols ? name : symbols.size === 1 ? [...symbols][0] : undefined; // conflicting declarations
+  };
   const exportsBySymbol = new Map<string, RustFfiExport[]>();
   for (const exp of rustFiles.flatMap(f => f.exports)) {
     const entries = exportsBySymbol.get(exp.symbolName) ?? [];
@@ -76,6 +92,8 @@ export async function luaRustBridgeEdges(queries: QueryBuilder, ctx: ResolutionC
     routesByExport.set(route.export.functionId, entries);
   }
   const edges: Edge[] = [];
+  // One edge per caller and handler; every operation that reaches the handler stays on it.
+  const operationEdges = new Map<string, Edge>();
   const carriers = new Map<string, Channel[]>();
   const sitesByTarget = new Map<string, Site[]>();
   const queue: Array<{ nodeId: string; channel: Channel }> = [];
@@ -133,9 +151,15 @@ export async function luaRustBridgeEdges(queries: QueryBuilder, ctx: ResolutionC
     const route = matching[0]!;
     const target = rustNode(ctx, route.target);
     if (!target) return false;
-    edges.push({ source: site.source.id, target: target.id, kind: 'calls', line: site.call.line,
+    const key = `${site.source.id}>${target.id}`;
+    const operations = operationEdges.get(key)?.metadata?.operations as string[] | undefined;
+    if (operations) {
+      if (!operations.includes(route.operation)) operations.push(route.operation);
+      return false;
+    }
+    operationEdges.set(key, { source: site.source.id, target: target.id, kind: 'calls', line: site.call.line,
       column: site.call.column, provenance: 'heuristic', metadata: {
-        synthesizedBy: 'lua-rust-operation', operation: route.operation,
+        synthesizedBy: 'lua-rust-operation', operation: route.operation, operations: [route.operation],
         nativeExport: native.id, nativeSymbol: route.export.symbolName,
         registeredAt: `${route.dispatcher.filePath}:${route.dispatchLine}`,
         sourceCall: `${site.file}:${site.call.line}:${site.call.column}`,
@@ -144,8 +168,9 @@ export async function luaRustBridgeEdges(queries: QueryBuilder, ctx: ResolutionC
     return false;
   };
   for (const site of sites) {
-    if (!site.call.ffiSymbol) continue;
-    const matches = exportsBySymbol.get(site.call.ffiSymbol) ?? [];
+    const symbol = site.call.ffiSymbol && linkedSymbol(site.call.ffiSymbol);
+    if (!symbol) continue;
+    const matches = exportsBySymbol.get(symbol) ?? [];
     if (matches.length !== 1) continue; // identical exports in separate native libraries
     const exp = matches[0]!;
     const fn = functions.get(exp.functionId);
@@ -186,5 +211,9 @@ export async function luaRustBridgeEdges(queries: QueryBuilder, ctx: ResolutionC
     }
     if ((cursor & 127) === 0) await onYield();
   }
-  return edges;
+  for (const edge of operationEdges.values()) {
+    const operations = (edge.metadata!.operations as string[]).sort();
+    edge.metadata!.operation = operations[0];
+  }
+  return [...edges, ...operationEdges.values()];
 }

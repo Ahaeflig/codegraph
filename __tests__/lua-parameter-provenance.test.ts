@@ -15,6 +15,8 @@ describe('Lua parameter provenance across nested functions and assignments', () 
 function Bridge.call(op) return op end
 return Bridge`);
     fs.writeFileSync(path.join(dir, 'caller.lua'), source);
+    // The parameter rule serves the Lua/Rust bridge, so only such projects use it.
+    fs.writeFileSync(path.join(dir, 'lib.rs'), 'pub fn native() {}\n');
     cg = await CodeGraph.init(dir, { silent: true });
     await cg.indexAll();
   }

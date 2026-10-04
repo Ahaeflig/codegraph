@@ -2,15 +2,18 @@
  * project configuration are used: ABI exports, argument forwarding and literal
  * dispatch arms must all be present in the parsed source. Unknown transforms,
  * receivers and ambiguous function names deliberately stop the proof. */
-import type { Node as SyntaxNode } from 'web-tree-sitter';
+import type { Parser } from 'web-tree-sitter';
 import { getParser, loadGrammarsForLanguages } from '../extraction/grammars';
 import { parseWithinBudget } from '../extraction/parse-budget';
+import { mirrorTree, type SyntaxMirror as SyntaxNode } from './syntax-mirror';
 
 export interface RustFunctionSummary {
   id: string;
   filePath: string;
   name: string;
   owner?: string;
+  /** A trait's default method: an impl may override it, so no call proves this body. */
+  trait?: boolean;
   line: number;
   column: number;
   parameters: string[];
@@ -73,6 +76,8 @@ export interface RustFfiFileAnalysis {
   potentialDispatchParameters: Record<string, number[]>;
   macroContracts: RustMacroContract[];
   macroDefinitions: RustFunctionSummary[];
+  /** No grammar, or a parse ran past its budget: the analysis may miss facts, and no cache keeps it. */
+  partial?: true;
 }
 export interface RustFfiDispatchRoute {
   export: RustFfiExport;
@@ -114,6 +119,15 @@ function literal(node: SyntaxNode | null): string | undefined {
   }
   if (node.type !== 'string_literal') return undefined;
   try { return JSON.parse(node.text) as string; } catch { return undefined; }
+}
+/** The literals a pattern matches when it is only literals (`"a"` or `"a" | "b"`). */
+function literalAlternatives(node: SyntaxNode | null): string[] | null {
+  if (!node) return null;
+  const value = literal(node);
+  if (value !== undefined) return [value];
+  if (node.type !== 'or_pattern') return null;
+  const parts = significant(node).map(literalAlternatives);
+  return parts.every((part): part is string[] => part !== null) ? parts.flat() : null;
 }
 function typeName(node: SyntaxNode | null): string | undefined {
   if (!node) return undefined;
@@ -167,6 +181,17 @@ function dispatchArm(node: SyntaxNode | null, wrappers: Set<string>): { node: Sy
 }
 function bind(pattern: SyntaxNode | null, value: Value, env: Env): void {
   if (!pattern) return;
+  if (pattern.type === 'match_pattern') {
+    // A guard reads bindings; it does not bind the scrutinee to them.
+    const guard = field(pattern, 'condition');
+    for (const child of significant(pattern)) if (child.id !== guard?.id) bind(child, value, env);
+    return;
+  }
+  if (pattern.type === 'struct_pattern' || pattern.type === 'slice_pattern') {
+    // Each destructured field is a part of the value, never the whole operation.
+    for (const child of significant(pattern)) bind(child, unknown(), env);
+    return;
+  }
   if (pattern.type === 'identifier' || pattern.type === 'self') {
     const previous = env.get(pattern.text);
     env.set(pattern.text, previous ? { ...value, possibleOrigins: [...new Set([...possibleOrigins(previous), ...possibleOrigins(value)])] } : value);
@@ -206,6 +231,14 @@ function invalidateWrites(node: SyntaxNode, scope: Env): void {
   }
   for (const child of node.namedChildren) invalidateWrites(child, scope);
 }
+/** A content key for a value; a closure is its body plus what it captured. */
+function valueKey(value: Value | undefined): string {
+  return JSON.stringify(value ?? null, (key, item) => {
+    if (key === 'closure') return { node: item.node.id, scope: [...(item.scope as Env)] };
+    if (key === 'dispatchResults') return (item as RustDispatchSummary[]).map(dispatch => `${dispatch.functionId}:${dispatch.operation}:${dispatch.line}`);
+    return item;
+  });
+}
 function merge(values: Value[]): Value {
   if (!values.length) return unknown();
   const first = values[0]!;
@@ -220,12 +253,25 @@ function merge(values: Value[]): Value {
   };
 }
 
+/** Parse and copy `text`; the tree-sitter tree is released immediately. */
+function parseMirror(parser: Parser, text: string): SyntaxNode | null {
+  const tree = parseWithinBudget(parser, text);
+  if (!tree) return null;
+  try { return mirrorTree(tree, text); } finally { tree.delete(); }
+}
+
 export async function analyzeRustFfiFile(filePath: string, source: string): Promise<RustFfiFileAnalysis> {
   const result: RustFfiFileAnalysis = { filePath, functions: [], exports: [], calls: [], dispatches: [], potentialDispatchParameters: {}, macroContracts: [], macroDefinitions: [] };
   await loadGrammarsForLanguages(['rust']);
   const parser = getParser('rust');
-  const tree = parser ? parseWithinBudget(parser, source) : null;
-  if (!tree || !parser) return result;
+  if (!parser) return { ...result, partial: true };
+  const parse = (text: string): SyntaxNode | null => {
+    const node = parseMirror(parser, text);
+    if (!node) result.partial = true;
+    return node;
+  };
+  const root = parse(source);
+  if (!root) return result;
   const statics: Env = new Map();
   const unitStructs = new Set<string>();
   const declaredTypes = new Set<string>();
@@ -298,7 +344,7 @@ export async function analyzeRustFfiFile(filePath: string, source: string): Prom
   }
   const functions: Array<{ node: SyntaxNode; summary: RustFunctionSummary }> = [];
   const callById = new Map<string, RustCallSummary>();
-  function collect(node: SyntaxNode, owner?: string, modulePath = '', threadLocal = false): void {
+  function collect(node: SyntaxNode, owner?: string, modulePath = '', threadLocal = false, trait = false): void {
     if (node.type === 'mod_item') modulePath = `${modulePath}::${field(node, 'name')?.text ?? ''}`;
     if (node.type === 'use_declaration') {
       const argument = field(node, 'argument'); const names = imports.get(modulePath) ?? new Map<string, string>();
@@ -308,7 +354,8 @@ export async function analyzeRustFfiFile(filePath: string, source: string): Prom
     if (node.type === 'struct_item' && !field(node, 'body')) {
       const name = field(node, 'name')?.text; if (name) unitStructs.add(`${modulePath}\0${name}`);
     }
-    if (node.type === 'impl_item') owner = typeName(field(node, 'type'));
+    if (node.type === 'impl_item') { owner = typeName(field(node, 'type')); trait = false; }
+    if (node.type === 'trait_item') { owner = field(node, 'name')?.text; trait = true; }
     if (node.type === 'static_item' || node.type === 'const_item') {
       const name = field(node, 'name')?.text;
       if (name) {
@@ -322,8 +369,8 @@ export async function analyzeRustFfiFile(filePath: string, source: string): Prom
     // Parse those tokens rather than inferring a receiver from its spelling.
     if (node.type === 'macro_invocation' && standardThreadLocal(field(node, 'macro')?.text ?? '', modulePath)) {
       const tokens = node.namedChildren.find(n => n.type === 'token_tree');
-      const expanded = tokens ? parseWithinBudget(parser!, tokens.text.slice(1, -1)) : null;
-      if (expanded) { for (const child of expanded.rootNode.namedChildren) if (child.type === 'static_item') collect(child, undefined, modulePath, true); expanded.delete(); }
+      const expanded = tokens ? parse(tokens.text.slice(1, -1)) : null;
+      for (const child of expanded?.namedChildren ?? []) if (child.type === 'static_item') collect(child, undefined, modulePath, true);
     }
     if (node.type === 'macro_definition') {
       const name = field(node, 'name')?.text;
@@ -350,18 +397,16 @@ export async function analyzeRustFfiFile(filePath: string, source: string): Prom
           text += part.text.slice(at - part.startIndex);
           return part.type === 'token_repetition' ? text.replace(/^\$\(/, '').replace(/\)[+*?]$/, '') : text;
         };
-        const expanded = parseWithinBudget(parser!, `fn __macro_probe() ${render(right)}`);
+        const expanded = parse(`fn __macro_probe() ${render(right)}`);
         if (!expanded) continue;
-        try {
-          const forwarded = new Set<string>();
-          const walk = (part: SyntaxNode): void => {
-            if (['macro_invocation', 'closure_expression'].includes(part.type)) return;
-            if (part.type === 'call_expression') { const name = field(part, 'function')?.text; if (name?.startsWith('__bridge_macro_')) forwarded.add(name.slice('__bridge_macro_'.length)); }
-            for (const child of part.namedChildren) walk(child);
-          };
-          if (!expanded.rootNode.hasError) walk(expanded.rootNode);
-          result.macroContracts.push({ declaration, shape: pairs ? 'pairs' : list ? 'list' : 'single', forwardedSlots: slots.flatMap((slot, i) => forwarded.has(slot) ? [i] : []) });
-        } finally { expanded.delete(); }
+        const forwarded = new Set<string>();
+        const walk = (part: SyntaxNode): void => {
+          if (['macro_invocation', 'closure_expression'].includes(part.type)) return;
+          if (part.type === 'call_expression') { const name = field(part, 'function')?.text; if (name?.startsWith('__bridge_macro_')) forwarded.add(name.slice('__bridge_macro_'.length)); }
+          for (const child of part.namedChildren) walk(child);
+        };
+        if (!expanded.hasError) walk(expanded);
+        result.macroContracts.push({ declaration, shape: pairs ? 'pairs' : list ? 'list' : 'single', forwardedSlots: slots.flatMap((slot, i) => forwarded.has(slot) ? [i] : []) });
       }
       if (unsupportedRule) result.macroContracts = result.macroContracts.filter(c => c.declaration.id !== declaration.id);
       return;
@@ -370,14 +415,14 @@ export async function analyzeRustFfiFile(filePath: string, source: string): Prom
       const name = field(node, 'name')?.text;
       if (!name || node.hasError) return;
       const params = field(node, 'parameters')?.namedChildren ?? [];
-      const summary: RustFunctionSummary = { id: `${filePath}:${node.startIndex}`, filePath, name, owner, modulePath, imports: {}, invokedParameters: [], line: node.startPosition.row + 1, column: node.startPosition.column,
+      const summary: RustFunctionSummary = { id: `${filePath}:${node.startIndex}`, filePath, name, owner, ...(trait ? { trait: true } : {}), modulePath, imports: {}, invokedParameters: [], line: node.startPosition.row + 1, column: node.startPosition.column,
         returnType: typeName(field(node, 'return_type')) === 'Self' ? owner : typeName(field(node, 'return_type')),
         parameters: params.map(p => p.type === 'self_parameter' ? 'self' : field(p, 'pattern')?.text ?? ''), hasSelf: params.some(p => p.type === 'self_parameter') };
       functions.push({ node, summary }); result.functions.push(summary);
       const modifiers = node.namedChildren.find(n => n.type === 'function_modifiers');
       const abi = modifiers?.namedChildren.find(n => n.type === 'extern_modifier');
       const abiName = abi?.namedChildren.find(n => n.type === 'string_literal');
-      if (abi && (!abiName || literal(abiName) === 'C')) {
+      if (abi && (!abiName || ['C', 'C-unwind'].includes(literal(abiName) ?? ''))) {
         const attrs: string[] = [];
         let previous = node.previousNamedSibling;
         while (previous && (previous.type === 'attribute_item' || previous.type.endsWith('comment'))) {
@@ -393,265 +438,290 @@ export async function analyzeRustFfiFile(filePath: string, source: string): Prom
       }
       return;
     }
-    for (const child of node.namedChildren) collect(child, owner, modulePath);
+    for (const child of node.namedChildren) collect(child, owner, modulePath, false, trait);
   }
-  try {
-    collectNamespaceBindings(tree.rootNode);
-    collect(tree.rootNode);
-    for (const { node: functionNode, summary } of functions) {
-      summary.imports = Object.fromEntries(imports.get(summary.modulePath) ?? []);
-      const env: Env = new Map([...statics].filter(([key]) => key.startsWith(`${summary.modulePath}\0`)).map(([key, value]) => [key.slice(summary.modulePath.length + 1), value]));
-      const params = field(functionNode, 'parameters')?.namedChildren ?? [];
-      params.forEach((p, index) => {
-        if (p.type === 'self_parameter') env.set('self', { origins: [index], type: summary.owner });
-        else bind(field(p, 'pattern'), { origins: [index], type: typeName(field(p, 'type')) }, env);
-      });
-      const returnedDispatches = new Set<RustDispatchSummary>();
-      const activeCallbacks: RustCallbackRequirement[] = [];
-      const activeClosures = new Set<number>();
-      function evaluate(node: SyntaxNode | null, scope: Env): Value {
-        if (!node) return unknown();
-        if (node.type === 'identifier' || node.type === 'self') return scope.get(node.text) ?? (unitStructs.has(`${summary.modulePath}\0${node.text}`) ? { origins: [], type: node.text } : unknown());
-        if (node.type === 'function_item') return unknown();
-        if (node.type === 'macro_invocation') {
-          const macroName = field(node, 'macro')?.text;
-          const tokens = node.namedChildren.find(n => n.type === 'token_tree');
-          if (!macroName || !tokens) return unknown();
-          const groups: SyntaxNode[][] = [[]];
-          for (const token of tokens.children.slice(1, -1)) {
-            if (token.text === ',') groups.push([]); else groups[groups.length - 1]!.push(token);
-          }
-          const nonempty = groups.filter(g => g.length);
-          const pairs = nonempty.length > 0 && nonempty.every(g => g.filter(t => t.text === '=>').length === 1);
-          const fragments: Array<{ source: string; slot: number; shape: 'pairs' | 'list' | 'single' }> = [];
-          for (const group of nonempty) {
-            if (pairs) {
-              const split = group.findIndex(t => t.text === '=>');
-              for (const [slot, parts] of [group.slice(0, split), group.slice(split + 1)].entries()) if (parts.length) fragments.push({ source: parts.map(p => p.text).join(' '), slot, shape: 'pairs' });
-            } else {
-              fragments.push({ source: group.map(p => p.text).join(' '), slot: 0, shape: 'list' });
-              if (nonempty.length === 1) fragments.push({ source: group.map(p => p.text).join(' '), slot: 0, shape: 'single' });
-            }
-          }
-          for (const fragment of fragments) {
-            // Most macros contain no tracked function value. Avoid reparsing
-            // their token payloads; this filter can only skip impossible proofs.
-            if (!(fragment.source.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []).some(name => scope.get(name)?.callResults?.length)) continue;
-            const parsed = parseWithinBudget(parser!, `fn __macro_argument(){ ${fragment.source} }`);
-            if (!parsed) continue;
-            try {
-              const scan = (part: SyntaxNode): void => {
-                if (['closure_expression', 'macro_invocation', 'let_declaration'].includes(part.type)) return;
-                if (part.type === 'block' && part.namedChildren.some(c => c.type === 'let_declaration')) return;
-                if (part.type === 'call_expression') {
-                  const callee = field(part, 'function');
-                  if (callee?.type === 'identifier') for (const id of scope.get(callee.text)?.callResults ?? []) {
-                    const call = callById.get(id);
-                    if (call) (call.invocationProofs ??= []).push({ callbacks: [...activeCallbacks], macro: { callerId: summary.id, name: macroName, shape: fragment.shape, slot: fragment.slot } });
-                  }
-                }
-                for (const child of part.namedChildren) scan(child);
-              };
-              if (!parsed.rootNode.hasError) scan(parsed.rootNode);
-            } finally { parsed.delete(); }
-          }
-          return unknown();
+  collectNamespaceBindings(root);
+  collect(root);
+  for (const { node: functionNode, summary } of functions) {
+    summary.imports = Object.fromEntries(imports.get(summary.modulePath) ?? []);
+    const env: Env = new Map([...statics].filter(([key]) => key.startsWith(`${summary.modulePath}\0`)).map(([key, value]) => [key.slice(summary.modulePath.length + 1), value]));
+    const params = field(functionNode, 'parameters')?.namedChildren ?? [];
+    params.forEach((p, index) => {
+      if (p.type === 'self_parameter') env.set('self', { origins: [index], type: summary.owner });
+      else bind(field(p, 'pattern'), { origins: [index], type: typeName(field(p, 'type')) }, env);
+    });
+    const returnedDispatches = new Set<RustDispatchSummary>();
+    const activeCallbacks: RustCallbackRequirement[] = [];
+    const activeClosures = new Set<number>();
+    const closureResults = new Map<string, Value>();
+    function evaluate(node: SyntaxNode | null, scope: Env): Value {
+      if (!node) return unknown();
+      if (node.type === 'identifier' || node.type === 'self') return scope.get(node.text) ?? (unitStructs.has(`${summary.modulePath}\0${node.text}`) ? { origins: [], type: node.text } : unknown());
+      if (node.type === 'function_item') return unknown();
+      if (node.type === 'macro_invocation') {
+        const macroName = field(node, 'macro')?.text;
+        const tokens = node.namedChildren.find(n => n.type === 'token_tree');
+        if (!macroName || !tokens) return unknown();
+        const groups: SyntaxNode[][] = [[]];
+        for (const token of tokens.children.slice(1, -1)) {
+          if (token.text === ',') groups.push([]); else groups[groups.length - 1]!.push(token);
         }
-        if (node.type === 'block') {
-          const local = new Map(scope);
-          // Rust items are block-scoped and order-independent, including uses
-          // that shadow a standard conversion imported by the enclosing module.
-          for (const child of significant(node)) {
-            if (child.type === 'use_declaration') {
-              const argument = field(child, 'argument');
-              const names = new Map<string, string>();
-              if (argument) {
-                collectUse(argument, names);
-                if (argument.type === 'use_wildcard' || argument.descendantsOfType('use_wildcard').length) local.set('*', unknown());
+        const nonempty = groups.filter(g => g.length);
+        const pairs = nonempty.length > 0 && nonempty.every(g => g.filter(t => t.text === '=>').length === 1);
+        const fragments: Array<{ source: string; slot: number; shape: 'pairs' | 'list' | 'single' }> = [];
+        for (const group of nonempty) {
+          if (pairs) {
+            const split = group.findIndex(t => t.text === '=>');
+            for (const [slot, parts] of [group.slice(0, split), group.slice(split + 1)].entries()) if (parts.length) fragments.push({ source: parts.map(p => p.text).join(' '), slot, shape: 'pairs' });
+          } else {
+            fragments.push({ source: group.map(p => p.text).join(' '), slot: 0, shape: 'list' });
+            if (nonempty.length === 1) fragments.push({ source: group.map(p => p.text).join(' '), slot: 0, shape: 'single' });
+          }
+        }
+        for (const fragment of fragments) {
+          // Most macros contain no tracked function value. Avoid reparsing
+          // their token payloads; this filter can only skip impossible proofs.
+          if (!(fragment.source.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []).some(name => scope.get(name)?.callResults?.length)) continue;
+          const parsed = parse(`fn __macro_argument(){ ${fragment.source} }`);
+          if (!parsed) continue;
+          const scan = (part: SyntaxNode): void => {
+            if (['closure_expression', 'macro_invocation', 'let_declaration'].includes(part.type)) return;
+            if (part.type === 'block' && part.namedChildren.some(c => c.type === 'let_declaration')) return;
+            if (part.type === 'call_expression') {
+              const callee = field(part, 'function');
+              if (callee?.type === 'identifier') for (const id of scope.get(callee.text)?.callResults ?? []) {
+                const call = callById.get(id);
+                if (call) (call.invocationProofs ??= []).push({ callbacks: [...activeCallbacks], macro: { callerId: summary.id, name: macroName, shape: fragment.shape, slot: fragment.slot } });
               }
-              for (const [name, importPath] of names) local.set(name, { origins: [], importPath });
-            } else if (['mod_item', 'function_item', 'struct_item', 'enum_item', 'type_item'].includes(child.type)) {
-              const name = field(child, 'name')?.text;
-              if (name) local.set(name, { origins: [], namespace: true });
             }
-          }
-          let value = unknown();
-          for (const child of significant(node)) {
-            if (['use_declaration', 'mod_item', 'struct_item', 'enum_item', 'type_item'].includes(child.type)) continue;
-            value = evaluate(child, local);
-          }
-          // Writes through a nested scope can rebind an outer operation or
-          // function pointer. Do not retain the old proof across that scope.
-          invalidateWrites(node, scope);
-          return value;
-        }
-        if (node.type === 'reference_expression') {
-          const referenced = field(node, 'value') ?? significant(node).at(-1) ?? null;
-          const value = evaluate(referenced, scope);
-          if (node.namedChildren.some(n => n.type === 'mutable_specifier') && referenced?.type === 'identifier') {
-            scope.set(referenced.text, forget(scope.get(referenced.text)));
-          }
-          return value;
-        }
-        if (['unsafe_block', 'parenthesized_expression', 'try_expression'].includes(node.type)) return evaluate(significant(node).at(-1) ?? null, scope);
-        if (node.type === 'tuple_expression') return { origins: [], tuple: significant(node).map(n => evaluate(n, scope)) };
-        if (node.type === 'let_declaration') {
-          const value = evaluate(field(node, 'value'), scope);
-          const annotated = typeName(field(node, 'type'));
-          bind(field(node, 'pattern'), annotated ? { ...value, type: annotated } : value, scope);
-          return unknown();
-        }
-        if (node.type === 'assignment_expression') {
-          const value = evaluate(field(node, 'right'), scope);
-          bind(field(node, 'left'), value, scope);
-          return unknown();
-        }
-        if (node.type === 'struct_expression') return { origins: [], type: typeName(field(node, 'name')) };
-        if (node.type === 'if_expression') {
-          const condition = field(node, 'condition');
-          const local = new Map(scope);
-          if (condition?.type === 'let_condition') bind(field(condition, 'pattern'), evaluate(field(condition, 'value'), scope), local);
-          else evaluate(condition, scope);
-          const yes = evaluate(field(node, 'consequence'), local);
-          const no = evaluate(field(node, 'alternative'), new Map(scope));
-          invalidateWrites(node, scope);
-          return merge([yes, no]);
-        }
-        if (node.type === 'closure_expression') return { origins: [], closure: { node, scope: new Map(scope) } };
-        if (node.type === 'match_expression') {
-          const value = evaluate(field(node, 'value'), scope);
-          const outputs: Value[] = [];
-          for (const arm of field(node, 'body')?.namedChildren ?? []) {
-            if (arm.type !== 'match_arm') continue;
-            const pattern = field(arm, 'pattern');
-            const armValue = field(arm, 'value');
-            const local = new Map(scope);
-            bind(pattern, value, local);
-            const operation = literal(pattern?.namedChildren[0] ?? pattern);
-            const possibleParameters = possibleOrigins(value);
-            const potentialDispatch = operation !== undefined && possibleParameters.length > 0;
-            if (potentialDispatch) result.potentialDispatchParameters[summary.id] = [...new Set([
-              ...(result.potentialDispatchParameters[summary.id] ?? []), ...possibleParameters,
-            ])];
-            const wrappers = new Set(['Some', 'Ok'].filter(name => !local.has(name) && !summary.imports[name] && !result.functions.some(f => f.name === name && !f.owner && f.modulePath === summary.modulePath)));
-            const armShape = dispatchArm(armValue, wrappers);
-            const armTarget = target(armShape?.node ?? null, local, summary.owner);
-            // Guards can select a different target for the same literal. Leave
-            // guarded mappings unresolved rather than claiming exclusivity.
-            let armDispatch: RustDispatchSummary | undefined;
-            if (potentialDispatch) {
-              const unresolved = !armTarget || (armTarget.method && !armTarget.owner) ||
-                (armShape?.node.type === 'identifier' && local.has(armShape.node.text) && !local.get(armShape.node.text)?.importPath);
-              armDispatch = { functionId: summary.id, operation: operation!, parameterIndex: value.origins.length === 1 ? value.origins[0]! : -1, targetName: armTarget?.name ?? '',
-                targetOwner: armTarget?.owner, line: arm.startPosition.row + 1, returnsFunction: !unresolved && !!armShape?.returnsFunction, requiredCallbacks: [...activeCallbacks],
-                guarded: !!(pattern && field(pattern, 'condition')), unresolved: !!unresolved };
-              result.dispatches.push(armDispatch);
-            }
-            const output = evaluate(armValue, local);
-            if (armDispatch?.returnsFunction) output.dispatchResults = [armDispatch];
-            if (armValue?.type !== 'return_expression') outputs.push(output);
-          }
-          invalidateWrites(node, scope);
-          return merge(outputs);
-        }
-        if (node.type === 'call_expression') {
-          const callee = field(node, 'function');
-          const args = field(node, 'arguments')?.namedChildren ?? [];
-          const values = args.map(arg => evaluate(arg, scope));
-          const to = target(callee, scope, summary.owner);
-          const plainCallee = callee?.type === 'generic_function' ? field(callee, 'function') : callee;
-          const calleeParts = (plainCallee?.text ?? '').split('::');
-          const importedHead = scope.get(calleeParts[0]!)?.importPath ??
-            (!scope.has(calleeParts[0]!) && imports.get(summary.modulePath)?.get(calleeParts[0]!));
-          const canonicalCallee = importedHead ? [importedHead, ...calleeParts.slice(1)].join('::') : plainCallee?.text ?? '';
-          for (const arg of args) if (arg.type === 'reference_expression' && arg.namedChildren.some(n => n.type === 'mutable_specifier')) {
-            const value = field(arg, 'value');
-            if (value?.type === 'identifier') scope.set(value.text, forget(scope.get(value.text)));
-          }
-          if (callee?.type === 'field_expression' && !NON_MUTATING_RECEIVER_METHODS.has(to?.name ?? '')) {
-            const receiver = field(callee, 'value');
-            if (receiver && ['identifier', 'self'].includes(receiver.type) && scope.get(receiver.text)?.origins.length) scope.set(receiver.text, forget(scope.get(receiver.text)));
-          }
-          // Evaluate chained receivers, but do not guess their type.
-          if (callee?.type === 'field_expression') evaluate(field(callee, 'value'), scope);
-          const invokeClosure = (value: Value | undefined, arguments_: Value[] = []): Value => {
-            if (!value?.closure) {
-              if (!activeCallbacks.length) for (const index of value?.origins ?? []) if (!summary.invokedParameters.includes(index)) summary.invokedParameters.push(index);
-              return unknown();
-            }
-            const closureId = value.closure.node.id;
-            if (activeClosures.has(closureId)) return unknown();
-            const local = new Map(value.closure.scope);
-            (field(value.closure.node, 'parameters')?.namedChildren ?? []).forEach((p, i) => bind(p, arguments_[i] ?? unknown(), local));
-            activeClosures.add(closureId);
-            try { return evaluate(field(value.closure.node, 'body'), local); }
-            finally { activeClosures.delete(closureId); }
+            for (const child of part.namedChildren) scan(child);
           };
-          if (to?.method && to.name === 'with' && to.receiver?.threadLocal) invokeClosure(values[0], [{ ...to.receiver, threadLocal: false }]);
-          if (callee?.type === 'identifier' && scope.get(callee.text)?.closure) return invokeClosure(scope.get(callee.text), values);
-          // Standard unwind wrappers execute/preserve their callback. Unknown
-          // higher-order functions cannot activate a dormant closure by name.
-          if (['std::panic::catch_unwind', 'core::panic::catch_unwind'].includes(canonicalCallee) && standardNamespace(canonicalCallee, summary.modulePath, scope)) invokeClosure(values[0]);
-          if (['std::panic::AssertUnwindSafe', 'core::panic::AssertUnwindSafe'].includes(canonicalCallee) && standardNamespace(canonicalCallee, summary.modulePath, scope)) return values[0] ?? unknown();
-          if (to && !(to.method && to.name === 'with' && to.receiver?.threadLocal) && !(['std::panic::catch_unwind', 'core::panic::catch_unwind'].includes(canonicalCallee) && standardNamespace(canonicalCallee, summary.modulePath, scope))) {
-            values.forEach((value, parameterIndex) => {
-              if (!value.closure) return;
-              activeCallbacks.push({ callerId: summary.id, targetName: to.name, targetOwner: to.owner, parameterIndex, method: to.method });
-              invokeClosure(value); activeCallbacks.pop();
-            });
+          if (!parsed.hasError) scan(parsed);
+        }
+        return unknown();
+      }
+      if (node.type === 'block') {
+        const local = new Map(scope);
+        // Rust items are block-scoped and order-independent, including uses
+        // that shadow a standard conversion imported by the enclosing module.
+        for (const child of significant(node)) {
+          if (child.type === 'use_declaration') {
+            const argument = field(child, 'argument');
+            const names = new Map<string, string>();
+            if (argument) {
+              collectUse(argument, names);
+              if (argument.type === 'use_wildcard' || argument.descendantsOfType('use_wildcard').length) local.set('*', unknown());
+            }
+            for (const [name, importPath] of names) local.set(name, { origins: [], importPath });
+          } else if (['mod_item', 'function_item', 'struct_item', 'enum_item', 'type_item'].includes(child.type)) {
+            const name = field(child, 'name')?.text;
+            if (name) local.set(name, { origins: [], namespace: true });
           }
-          if (callee?.type === 'identifier') for (const id of scope.get(callee.text)?.callResults ?? []) {
-            const call = callById.get(id); if (call) {
-              if (!activeCallbacks.length) call.resultInvoked = true;
-              else (call.invocationProofs ??= []).push({ callbacks: [...activeCallbacks] });
+        }
+        let value = unknown();
+        for (const child of significant(node)) {
+          if (['use_declaration', 'mod_item', 'struct_item', 'enum_item', 'type_item'].includes(child.type)) continue;
+          value = evaluate(child, local);
+        }
+        // Writes through a nested scope can rebind an outer operation or
+        // function pointer. Do not retain the old proof across that scope.
+        invalidateWrites(node, scope);
+        return value;
+      }
+      if (node.type === 'reference_expression') {
+        const referenced = field(node, 'value') ?? significant(node).at(-1) ?? null;
+        const value = evaluate(referenced, scope);
+        if (node.namedChildren.some(n => n.type === 'mutable_specifier') && referenced?.type === 'identifier') {
+          scope.set(referenced.text, forget(scope.get(referenced.text)));
+        }
+        return value;
+      }
+      if (['unsafe_block', 'parenthesized_expression', 'try_expression'].includes(node.type)) return evaluate(significant(node).at(-1) ?? null, scope);
+      if (node.type === 'tuple_expression') return { origins: [], tuple: significant(node).map(n => evaluate(n, scope)) };
+      if (node.type === 'let_declaration') {
+        const value = evaluate(field(node, 'value'), scope);
+        const annotated = typeName(field(node, 'type'));
+        bind(field(node, 'pattern'), annotated ? { ...value, type: annotated } : value, scope);
+        return unknown();
+      }
+      if (node.type === 'assignment_expression') {
+        const value = evaluate(field(node, 'right'), scope);
+        bind(field(node, 'left'), value, scope);
+        return unknown();
+      }
+      if (node.type === 'struct_expression') return { origins: [], type: typeName(field(node, 'name')) };
+      if (node.type === 'if_expression') {
+        const condition = field(node, 'condition');
+        const local = new Map(scope);
+        if (condition?.type === 'let_condition') bind(field(condition, 'pattern'), evaluate(field(condition, 'value'), scope), local);
+        else evaluate(condition, scope);
+        const yes = evaluate(field(node, 'consequence'), local);
+        const no = evaluate(field(node, 'alternative'), new Map(scope));
+        invalidateWrites(node, scope);
+        return merge([yes, no]);
+      }
+      if (node.type === 'closure_expression') return { origins: [], closure: { node, scope: new Map(scope) } };
+      if (node.type === 'match_expression') {
+        const value = evaluate(field(node, 'value'), scope);
+        const outputs: Value[] = [];
+        // Arms are tried in order. An earlier wildcard or identical literal makes a
+        // literal arm unreachable; an earlier guarded or conditional literal arm may take that
+        // literal, and an earlier non-literal pattern may take any value.
+        let catchAll = false;
+        let contestedAll = false;
+        const contested = new Set<string>();
+        const claimed = new Set<string>();
+        for (const arm of field(node, 'body')?.namedChildren ?? []) {
+          if (arm.type !== 'match_arm') continue;
+          const pattern = field(arm, 'pattern');
+          const guard = pattern ? field(pattern, 'condition') : null;
+          const shape = pattern?.namedChildren.find(child => child.id !== guard?.id) ?? null;
+          const operations = literalAlternatives(shape);
+          // An attribute (e.g. #[cfg]) may compile the arm out: it neither proves nor shadows a literal.
+          const conditional = arm.namedChildren.some(child => child.type === 'attribute_item' || child.type === 'inner_attribute_item');
+          const armValue = field(arm, 'value');
+          const local = new Map(scope);
+          bind(pattern, value, local);
+          const possibleParameters = possibleOrigins(value);
+          const potentialDispatch = !!operations && possibleParameters.length > 0;
+          if (potentialDispatch) result.potentialDispatchParameters[summary.id] = [...new Set([
+            ...(result.potentialDispatchParameters[summary.id] ?? []), ...possibleParameters,
+          ])];
+          const wrappers = new Set(['Some', 'Ok'].filter(name => !local.has(name) && !summary.imports[name] && !result.functions.some(f => f.name === name && !f.owner && f.modulePath === summary.modulePath)));
+          const armShape = dispatchArm(armValue, wrappers);
+          const armTarget = target(armShape?.node ?? null, local, summary.owner);
+          // Guards can select a different target for the same literal. Leave
+          // guarded mappings unresolved rather than claiming exclusivity.
+          const armDispatches: RustDispatchSummary[] = [];
+          if (potentialDispatch) {
+            const unknownTarget = !armTarget || (armTarget.method && !armTarget.owner) ||
+              (armShape?.node.type === 'identifier' && local.has(armShape.node.text) && !local.get(armShape.node.text)?.importPath);
+            for (const operation of operations!) {
+              if (catchAll || claimed.has(operation)) continue;
+              const unresolved = unknownTarget || conditional || contestedAll || contested.has(operation);
+              const dispatch: RustDispatchSummary = { functionId: summary.id, operation, parameterIndex: value.origins.length === 1 ? value.origins[0]! : -1, targetName: armTarget?.name ?? '',
+                targetOwner: armTarget?.owner, line: arm.startPosition.row + 1, returnsFunction: !unresolved && !!armShape?.returnsFunction, requiredCallbacks: [...activeCallbacks],
+                guarded: !!guard, unresolved: !!unresolved };
+              armDispatches.push(dispatch);
+              result.dispatches.push(dispatch);
             }
           }
-          if (callee?.type === 'identifier' && scope.has(callee.text) && !scope.get(callee.text)?.importPath) {
-            if (!activeCallbacks.length) for (const index of scope.get(callee.text)?.origins ?? []) if (!summary.invokedParameters.includes(index)) summary.invokedParameters.push(index);
+          if (conditional || guard) { if (operations) operations.forEach(operation => contested.add(operation)); else contestedAll = true; }
+          else if (!shape && pattern?.children.some(child => child.type === '_')) catchAll = true;
+          else if (operations) operations.forEach(operation => claimed.add(operation));
+          else contestedAll = true;
+          const output = evaluate(armValue, local);
+          const returned = armDispatches.filter(dispatch => dispatch.returnsFunction);
+          if (returned.length) output.dispatchResults = returned;
+          if (armValue?.type !== 'return_expression') outputs.push(output);
+        }
+        invalidateWrites(node, scope);
+        return merge(outputs);
+      }
+      if (node.type === 'call_expression') {
+        const callee = field(node, 'function');
+        const args = field(node, 'arguments')?.namedChildren ?? [];
+        const values = args.map(arg => evaluate(arg, scope));
+        const to = target(callee, scope, summary.owner);
+        const plainCallee = callee?.type === 'generic_function' ? field(callee, 'function') : callee;
+        const calleeParts = (plainCallee?.text ?? '').split('::');
+        const importedHead = scope.get(calleeParts[0]!)?.importPath ??
+          (!scope.has(calleeParts[0]!) && imports.get(summary.modulePath)?.get(calleeParts[0]!));
+        const canonicalCallee = importedHead ? [importedHead, ...calleeParts.slice(1)].join('::') : plainCallee?.text ?? '';
+        for (const arg of args) if (arg.type === 'reference_expression' && arg.namedChildren.some(n => n.type === 'mutable_specifier')) {
+          const value = field(arg, 'value');
+          if (value?.type === 'identifier') scope.set(value.text, forget(scope.get(value.text)));
+        }
+        if (callee?.type === 'field_expression' && !NON_MUTATING_RECEIVER_METHODS.has(to?.name ?? '')) {
+          const receiver = field(callee, 'value');
+          if (receiver && ['identifier', 'self'].includes(receiver.type) && scope.get(receiver.text)?.origins.length) scope.set(receiver.text, forget(scope.get(receiver.text)));
+        }
+        // Evaluate chained receivers, but do not guess their type.
+        if (callee?.type === 'field_expression') evaluate(field(callee, 'value'), scope);
+        const invokeClosure = (value: Value | undefined, arguments_: Value[] = []): Value => {
+          if (!value?.closure) {
+            if (!activeCallbacks.length) for (const index of value?.origins ?? []) if (!summary.invokedParameters.includes(index)) summary.invokedParameters.push(index);
             return unknown();
           }
-          if (to && (!to.method || to.owner)) {
-            const call: RustCallSummary = { id: `${summary.id}:${node.startIndex}`, fromFunctionId: summary.id, targetName: to.name, targetOwner: to.owner,
-              argumentOrigins: values.map(v => v.origins), argumentPossibilities: values.map(possibleOrigins), method: to.method, resultInvoked: false, requiredCallbacks: [...activeCallbacks], line: node.startPosition.row + 1 };
-            result.calls.push(call); callById.set(call.id, call);
-            // A function result is opaque, except known byte/string-preserving
-            // conversions. These are library semantics, not project mappings.
-            const path = canonicalCallee;
-            if (['std::str::from_utf8', 'core::str::from_utf8'].includes(path) && standardNamespace(path, summary.modulePath, scope)) return { ...(values[0] ?? unknown()), type: 'str', wrapped: true };
-            if (['std::slice::from_raw_parts', 'core::slice::from_raw_parts'].includes(path) && standardNamespace(path, summary.modulePath, scope)) return { ...(values[0] ?? unknown()), type: '[u8]' };
-            if (to.method && to.receiver?.borrowContainer && ['borrow', 'borrow_mut', 'try_borrow', 'try_borrow_mut'].includes(to.name)) return { ...to.receiver, type: to.receiver.borrowedType, borrowContainer: false, borrowedType: undefined, wrapped: to.name.startsWith('try_') };
-            const textType = to.receiver?.type;
-            const canonicalType = textType && (scope.get(textType)?.importPath ?? imports.get(summary.modulePath)?.get(textType) ?? textType);
-            const standardText = textType && !declaredTypes.has(textType) && !scope.get(textType)?.namespace && (['str', '[u8]'].includes(canonicalType!) || (['String', 'std::string::String', 'alloc::string::String'].includes(canonicalType!) && standardNamespace(canonicalType === 'String' ? 'std::string::String' : canonicalType!, summary.modulePath, scope)));
-            if (to.method && standardText && ['as_str', 'as_bytes', 'as_ptr', 'to_owned', 'to_string'].includes(to.name)) return to.receiver!;
-            if (to.method && to.receiver?.wrapped && ['unwrap', 'expect'].includes(to.name)) return { ...to.receiver, wrapped: false };
-            if (['Some', 'Ok'].includes(to.name) && !to.owner && !summary.imports[to.name] && !result.functions.some(f => f.name === to.name && !f.owner && f.modulePath === summary.modulePath)) return values[0] ?? unknown();
-            const definitions = !to.owner && summary.imports[to.name] ? [] : result.functions.filter(f => f.name === to.name && f.owner === to.owner && f.modulePath === summary.modulePath);
-            return { origins: [], callResults: [call.id], possibleOrigins: [...new Set([
-              ...values.flatMap(possibleOrigins), ...(to.receiver ? possibleOrigins(to.receiver) : []),
-            ])],
-              type: definitions.length === 1 ? definitions[0]!.returnType : undefined, wrapped: definitions.length === 1 && ['Option', 'Result'].includes(definitions[0]!.returnType ?? '') && !declaredTypes.has(definitions[0]!.returnType!) };
+          const closureId = value.closure.node.id;
+          if (activeClosures.has(closureId)) return unknown();
+          // The same body with the same captures, arguments and callback context records the same facts.
+          const key = `${valueKey(value)}|${arguments_.map(valueKey).join('|')}|${JSON.stringify(activeCallbacks)}`;
+          const cached = closureResults.get(key);
+          if (cached) return cached;
+          const local = new Map(value.closure.scope);
+          (field(value.closure.node, 'parameters')?.namedChildren ?? []).forEach((p, i) => bind(p, arguments_[i] ?? unknown(), local));
+          activeClosures.add(closureId);
+          try {
+            const returned = evaluate(field(value.closure.node, 'body'), local);
+            closureResults.set(key, returned);
+            return returned;
+          } finally { activeClosures.delete(closureId); }
+        };
+        if (to?.method && to.name === 'with' && to.receiver?.threadLocal) invokeClosure(values[0], [{ ...to.receiver, threadLocal: false }]);
+        if (callee?.type === 'identifier' && scope.get(callee.text)?.closure) return invokeClosure(scope.get(callee.text), values);
+        // Standard unwind wrappers execute/preserve their callback. Unknown
+        // higher-order functions cannot activate a dormant closure by name.
+        if (['std::panic::catch_unwind', 'core::panic::catch_unwind'].includes(canonicalCallee) && standardNamespace(canonicalCallee, summary.modulePath, scope)) invokeClosure(values[0]);
+        if (['std::panic::AssertUnwindSafe', 'core::panic::AssertUnwindSafe'].includes(canonicalCallee) && standardNamespace(canonicalCallee, summary.modulePath, scope)) return values[0] ?? unknown();
+        if (to && !(to.method && to.name === 'with' && to.receiver?.threadLocal) && !(['std::panic::catch_unwind', 'core::panic::catch_unwind'].includes(canonicalCallee) && standardNamespace(canonicalCallee, summary.modulePath, scope))) {
+          values.forEach((value, parameterIndex) => {
+            if (!value.closure) return;
+            activeCallbacks.push({ callerId: summary.id, targetName: to.name, targetOwner: to.owner, parameterIndex, method: to.method });
+            invokeClosure(value); activeCallbacks.pop();
+          });
+        }
+        if (callee?.type === 'identifier') for (const id of scope.get(callee.text)?.callResults ?? []) {
+          const call = callById.get(id); if (call) {
+            if (!activeCallbacks.length) call.resultInvoked = true;
+            else (call.invocationProofs ??= []).push({ callbacks: [...activeCallbacks] });
           }
+        }
+        if (callee?.type === 'identifier' && scope.has(callee.text) && !scope.get(callee.text)?.importPath) {
+          if (!activeCallbacks.length) for (const index of scope.get(callee.text)?.origins ?? []) if (!summary.invokedParameters.includes(index)) summary.invokedParameters.push(index);
           return unknown();
         }
-        if (node.type === 'return_expression') {
-          const returned = evaluate(significant(node).at(-1) ?? null, scope);
-          for (const dispatch of returned.dispatchResults ?? []) returnedDispatches.add(dispatch);
-          return returned;
+        if (to && (!to.method || to.owner)) {
+          const call: RustCallSummary = { id: `${summary.id}:${node.startIndex}`, fromFunctionId: summary.id, targetName: to.name, targetOwner: to.owner,
+            argumentOrigins: values.map(v => v.origins), argumentPossibilities: values.map(possibleOrigins), method: to.method, resultInvoked: false, requiredCallbacks: [...activeCallbacks], line: node.startPosition.row + 1 };
+          result.calls.push(call); callById.set(call.id, call);
+          // A function result is opaque, except known byte/string-preserving
+          // conversions. These are library semantics, not project mappings.
+          const path = canonicalCallee;
+          if (['std::str::from_utf8', 'core::str::from_utf8'].includes(path) && standardNamespace(path, summary.modulePath, scope)) return { ...(values[0] ?? unknown()), type: 'str', wrapped: true };
+          if (['std::slice::from_raw_parts', 'core::slice::from_raw_parts'].includes(path) && standardNamespace(path, summary.modulePath, scope)) return { ...(values[0] ?? unknown()), type: '[u8]' };
+          if (to.method && to.receiver?.borrowContainer && ['borrow', 'borrow_mut', 'try_borrow', 'try_borrow_mut'].includes(to.name)) return { ...to.receiver, type: to.receiver.borrowedType, borrowContainer: false, borrowedType: undefined, wrapped: to.name.startsWith('try_') };
+          const textType = to.receiver?.type;
+          const canonicalType = textType && (scope.get(textType)?.importPath ?? imports.get(summary.modulePath)?.get(textType) ?? textType);
+          const standardText = textType && !declaredTypes.has(textType) && !scope.get(textType)?.namespace && (['str', '[u8]'].includes(canonicalType!) || (['String', 'std::string::String', 'alloc::string::String'].includes(canonicalType!) && standardNamespace(canonicalType === 'String' ? 'std::string::String' : canonicalType!, summary.modulePath, scope)));
+          if (to.method && standardText && ['as_str', 'as_bytes', 'as_ptr', 'to_owned', 'to_string'].includes(to.name)) return to.receiver!;
+          if (to.method && to.receiver?.wrapped && ['unwrap', 'expect'].includes(to.name)) return { ...to.receiver, wrapped: false };
+          if (['Some', 'Ok'].includes(to.name) && !to.owner && !summary.imports[to.name] && !result.functions.some(f => f.name === to.name && !f.owner && f.modulePath === summary.modulePath)) return values[0] ?? unknown();
+          const definitions = !to.owner && summary.imports[to.name] ? [] : result.functions.filter(f => f.name === to.name && f.owner === to.owner && f.modulePath === summary.modulePath);
+          return { origins: [], callResults: [call.id], possibleOrigins: [...new Set([
+            ...values.flatMap(possibleOrigins), ...(to.receiver ? possibleOrigins(to.receiver) : []),
+          ])],
+            type: definitions.length === 1 ? definitions[0]!.returnType : undefined, wrapped: definitions.length === 1 && ['Option', 'Result'].includes(definitions[0]!.returnType ?? '') && !declaredTypes.has(definitions[0]!.returnType!) };
         }
-        if (node.type === 'expression_statement') { evaluate(significant(node).at(-1) ?? null, scope); return unknown(); }
-        // Traverse control-flow bodies with independent lexical scopes. Unknown
-        // expressions cannot manufacture an origin simply by mentioning it.
-        const children = significant(node).map(child => evaluate(child, new Map(scope)));
-        invalidateWrites(node, scope);
-        return { origins: [], possibleOrigins: [...new Set(children.flatMap(possibleOrigins))] };
+        return unknown();
       }
-      const returned = evaluate(field(functionNode, 'body'), env);
-      for (const dispatch of returned.dispatchResults ?? []) returnedDispatches.add(dispatch);
-      result.dispatches = result.dispatches.filter(d => d.functionId !== summary.id || !d.returnsFunction || returnedDispatches.has(d));
+      if (node.type === 'return_expression') {
+        const returned = evaluate(significant(node).at(-1) ?? null, scope);
+        for (const dispatch of returned.dispatchResults ?? []) returnedDispatches.add(dispatch);
+        return returned;
+      }
+      if (node.type === 'expression_statement') { evaluate(significant(node).at(-1) ?? null, scope); return unknown(); }
+      // Traverse control-flow bodies with independent lexical scopes. Unknown
+      // expressions cannot manufacture an origin simply by mentioning it.
+      const children = significant(node).map(child => evaluate(child, new Map(scope)));
+      invalidateWrites(node, scope);
+      return { origins: [], possibleOrigins: [...new Set(children.flatMap(possibleOrigins))] };
     }
-    return result;
-  } finally { tree.delete(); }
+    const returned = evaluate(field(functionNode, 'body'), env);
+    for (const dispatch of returned.dispatchResults ?? []) returnedDispatches.add(dispatch);
+    result.dispatches = result.dispatches.filter(d => d.functionId !== summary.id || !d.returnsFunction || returnedDispatches.has(d));
+  }
+  return result;
 }
 
 /** A source-identity oracle supplied by the integration layer when Cargo or
@@ -718,7 +788,7 @@ function functionResolver(functions: RustFunctionSummary[], resolveOwner?: RustO
 export function resolveRustFfiDispatch(files: RustFfiFileAnalysis[], resolveOwner?: RustOwnerResolver): RustFfiDispatchRoute[] {
   const functions = files.flatMap(f => f.functions);
   const byId = new Map(functions.map(f => [f.id, f]));
-  const resolve = functionResolver(functions, resolveOwner);
+  const resolve = functionResolver(functions.filter(f => !f.trait), resolveOwner);
   const callbackProof = (requirements: RustCallbackRequirement[] | undefined): boolean => (requirements ?? []).every(requirement => {
     const caller = byId.get(requirement.callerId);
     const target = caller && resolve(requirement.targetName, requirement.targetOwner, caller);
@@ -801,7 +871,7 @@ export function findRustDispatchingExports(files: RustFfiFileAnalysis[], resolve
   const byId = new Map(functions.map(f => [f.id, f]));
   const byName = functionsByName(functions);
   const predecessors = new Map<string, Array<{ from: RustFunctionSummary; to: RustFunctionSummary; call: RustCallSummary }>>();
-  const resolve = functionResolver(functions, resolveOwner, byName);
+  const resolve = functionResolver(functions.filter(f => !f.trait), resolveOwner);
   for (const call of files.flatMap(f => f.calls)) {
     const from = byId.get(call.fromFunctionId);
     if (!from) continue;
