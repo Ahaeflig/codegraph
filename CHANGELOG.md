@@ -16,6 +16,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - LuaJIT FFI calls can now connect to verified Rust exports and source-derived operation handlers, keeping separate operations distinct in callers and impact results.
 
+### Fixes
+
+- Separate `CODEGRAPH_DIR` indexes in one project now keep independent background servers, including on Windows and filesystems that require temporary sockets.
+
 ## [1.6.2] - 2026-10-03
 
 ### Highlights
